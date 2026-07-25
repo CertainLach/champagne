@@ -16,6 +16,7 @@ const SECONDS_1601_TO_1970: u64 = 11644473600;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const HEAP_ZERO_MEMORY: u32 = 0x8;
 const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
@@ -48,9 +49,27 @@ const C1_ALPHA: u16 = 0x100;
 const C1_DEFINED: u16 = 0x200;
 
 static PROCESS_HEAP: u8 = 0;
+/// Stands in for the always-present system module whose exports are the
+/// functions registered here.
+static KERNEL32_MODULE: u8 = 0;
 
 fn process_heap() -> *mut c_void {
     (&raw const PROCESS_HEAP).cast_mut().cast()
+}
+
+fn kernel32_handle() -> *mut c_void {
+    (&raw const KERNEL32_MODULE).cast_mut().cast()
+}
+
+fn module_handle(name: &str) -> Option<*mut c_void> {
+    let lowered = name.to_lowercase();
+    let stem = lowered.strip_suffix(".dll").unwrap_or(&lowered);
+    if matches!(stem, "kernel32" | "kernelbase" | "ntdll") {
+        return Some(kernel32_handle());
+    }
+    let peb = get_tib().get_peb();
+    peb.find_entry(&format!("{stem}.dll"))
+        .map(|entry| entry.base().cast_mut().cast())
 }
 
 fn wide(cell: &'static OnceLock<Vec<u16>>, s: &str) -> *mut u16 {
@@ -161,15 +180,16 @@ macro_rules! winfn {
         #[allow(non_snake_case)]
         extern "win64" fn $name($($p: $t),*) $(-> $r)? $body
         inventory::submit! {
-            WinFn { name: stringify!($name), ptr: || $name as *const () as usize }
+            $crate::winapis::WinFn { name: stringify!($name), ptr: || $name as *const () as usize }
         }
         $($(
             inventory::submit! {
-                WinFn { name: $alias, ptr: || $name as *const () as usize }
+                $crate::winapis::WinFn { name: $alias, ptr: || $name as *const () as usize }
             }
         )*)?
     )*};
 }
+pub(crate) use winfn;
 
 pub fn override_import(_module: &str, name: &str) -> Option<usize> {
     static TABLE: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
@@ -376,8 +396,8 @@ winfn! {
             return process_heap();
         }
         let name = unsafe { widestring::U16CStr::from_ptr_str(name) }.to_string_lossy();
-        match get_tib().get_peb().find_entry(&name.to_lowercase()) {
-            Some(entry) => entry.base().cast_mut().cast(),
+        match module_handle(&name) {
+            Some(handle) => handle,
             None => {
                 warn!("module not found: {name}");
                 get_tib().set_last_error(ERROR_MOD_NOT_FOUND);
@@ -395,9 +415,9 @@ winfn! {
             return 1;
         }
         let name = unsafe { widestring::U16CStr::from_ptr_str(name) }.to_string_lossy();
-        match get_tib().get_peb().find_entry(&name.to_lowercase()) {
-            Some(entry) => {
-                unsafe { out.write(entry.base().cast_mut().cast()) };
+        match module_handle(&name) {
+            Some(handle) => {
+                unsafe { out.write(handle) };
                 1
             }
             None => {
@@ -478,11 +498,6 @@ winfn! {
 
     fn SetUnhandledExceptionFilter(_filter: *mut c_void) -> *mut c_void {
         null_mut()
-    }
-
-    fn UnhandledExceptionFilter(_info: *mut c_void) -> i32 {
-        warn!("unhandled exception");
-        1
     }
 
     fn RaiseException(code: u32, flags: u32, _n_args: u32, _args: *const usize) {
@@ -823,10 +838,28 @@ winfn! {
     }
 
     fn GetProcAddress(module: *const (), proc: *const c_char) -> *const () {
-        let _ = module;
-        let proc = unsafe { CStr::from_ptr(proc) };
-        warn!("get proc: {proc:?}");
-        // get_tib().set_last_error(0x11223344);
+        if (proc as usize) < 0x10000 {
+            warn!("get proc by ordinal #{}: unsupported", proc as usize);
+            get_tib().set_last_error(ERROR_PROC_NOT_FOUND);
+            return null();
+        }
+        let Ok(name) = (unsafe { CStr::from_ptr(proc) }).to_str() else {
+            get_tib().set_last_error(ERROR_PROC_NOT_FOUND);
+            return null();
+        };
+        if let Some(ptr) = override_import("", name) {
+            debug!("get proc: {name} => override");
+            return ptr as *const ();
+        }
+        let peb = get_tib().get_peb();
+        if let Some(entry) = peb.find_entry_by_pc(module as usize) {
+            if let Ok(ptr) = entry.exported_fn_raw(name) {
+                debug!("get proc: {name} => {}", entry.base_name());
+                return ptr;
+            }
+        }
+        warn!("get proc not found: {name}");
+        get_tib().set_last_error(ERROR_PROC_NOT_FOUND);
         null()
     }
 }

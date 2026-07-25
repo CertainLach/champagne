@@ -93,6 +93,16 @@ impl LdrDataEntry {
     pub fn base(&self) -> *const () {
         self.dll_base
     }
+    pub fn size_of_image(&self) -> usize {
+        self.size_of_image
+    }
+    pub fn base_name(&self) -> String {
+        self.base_dll_name.to_string()
+    }
+    pub fn contains_pc(&self, pc: usize) -> bool {
+        let base = self.dll_base as usize;
+        (base..base + self.size_of_image).contains(&pc)
+    }
     pub fn exported_fn_raw(&self, name: &str) -> anyhow::Result<*const ()> {
         trace!("looking up export: {name}");
         let p = self.pe();
@@ -112,11 +122,17 @@ impl LdrDataEntry {
 /// Reference counted loader entry reference (currently leaks)
 pub struct OwnedLdrData(*mut UnsafeCell<LdrDataEntry>);
 impl OwnedLdrData {
-    pub fn new(full_name: NtUnicodeString, base_name: NtUnicodeString, base: *const ()) -> Self {
+    pub fn new(
+        full_name: NtUnicodeString,
+        base_name: NtUnicodeString,
+        base: *const (),
+        size_of_image: usize,
+    ) -> Self {
         let mut data = LdrDataEntry::default();
         data.full_dll_name = full_name;
         data.base_dll_name = base_name;
         data.dll_base = base;
+        data.size_of_image = size_of_image;
         let boxed = Box::new(UnsafeCell::new(data));
         Self(Box::into_raw(boxed))
     }
@@ -202,6 +218,15 @@ impl LdrData {
         }
         .find(|e| e.base_dll_name.to_string() == lib)
     }
+    pub fn find_by_pc(self: Pin<&Self>, pc: usize) -> Option<&LdrDataEntry> {
+        unsafe {
+            self.project_ref()
+                .in_load_order_module_list
+                .map_unchecked(|v| v.assume_init_ref())
+                .iter()
+        }
+        .find(|e| e.contains_pc(pc))
+    }
 }
 
 pub const TLS_MINIMUM_AVAILABLE: usize = 64;
@@ -243,6 +268,14 @@ pub trait PebLike {
             let ldr = (*self.get_ref().0).ldr;
             let pin = Pin::new_unchecked(&*ldr);
             pin.find_lib(entry)
+        }
+    }
+    // In windows this is unsynchronized, and thus may cause segfault.
+    fn find_entry_by_pc(&self, pc: usize) -> Option<&LdrDataEntry> {
+        unsafe {
+            let ldr = (*self.get_ref().0).ldr;
+            let pin = Pin::new_unchecked(&*ldr);
+            pin.find_by_pc(pc)
         }
     }
 }

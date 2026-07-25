@@ -37,6 +37,7 @@ use self::jitreg::register_jit_code;
 mod fuckup_cc;
 mod jitreg;
 mod mkstub;
+mod seh;
 mod winapis;
 mod wininternals;
 
@@ -95,7 +96,8 @@ impl PeImage {
         drop(map);
 
         info!("mapped to run = {image:?}, pe = {ro_orig_image:?}");
-        let mut entry = OwnedLdrData::new(full_name, base_name, image.as_ptr().cast());
+        let mut entry =
+            OwnedLdrData::new(full_name, base_name, image.as_ptr().cast(), image.len());
         info!("adding to PEB");
         get_tib()
             .get_peb()
