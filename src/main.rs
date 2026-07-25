@@ -4,7 +4,7 @@ use anyhow::{bail, ensure, Context, Result};
 use libc::ftruncate;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use nix::fcntl::OFlag;
-use nix::sys::mman::shm_open;
+use nix::sys::mman::{shm_open, shm_unlink};
 use nix::sys::stat::Mode;
 use nt_string::nt_unicode_str;
 use nt_string::unicode_string::NtUnicodeString;
@@ -22,7 +22,7 @@ use region::Protection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::mem::{forget, transmute};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 use std::ptr::{self, addr_of, null};
 use tracing::{debug, info, info_span, trace, warn};
 use tracing_subscriber::EnvFilter;
@@ -73,15 +73,26 @@ impl PeImage {
         let pe = PeFile::from_bytes(&ro_orig_image).context("pe validity check")?;
         let pe_data = pe.to_view();
 
+        static SHM_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let shm_name = format!(
+            "/dllloader-{}-{}",
+            std::process::id(),
+            SHM_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let map = shm_open(
-            format!("mapped").as_str(),
-            OFlag::O_RDWR | OFlag::O_CREAT,
+            shm_name.as_str(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
             Mode::S_IRWXU,
         )
         .context("shm")?;
-        unsafe { ftruncate(map.as_raw_fd(), pe_data.len() as i64) };
-        let mut image = unsafe { MmapMut::map_mut(map.into_raw_fd())? };
+        shm_unlink(shm_name.as_str()).context("shm_unlink")?;
+        ensure!(
+            unsafe { ftruncate(map.as_raw_fd(), pe_data.len() as i64) } == 0,
+            "ftruncate failed"
+        );
+        let mut image = unsafe { MmapMut::map_mut(map.as_raw_fd())? };
         image.copy_from_slice(&pe_data);
+        drop(map);
 
         info!("mapped to run = {image:?}, pe = {ro_orig_image:?}");
         let mut entry = OwnedLdrData::new(full_name, base_name, image.as_ptr().cast());
