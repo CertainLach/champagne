@@ -5,6 +5,15 @@ use tracing::{debug, info, warn};
 use crate::wininternals::{get_tib, PebLike, TLS_OUT_OF_INDEXES};
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_NO_MORE_ITEMS: u32 = 259;
+const HEAP_ZERO_MEMORY: u32 = 0x8;
+const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
+
+static PROCESS_HEAP: u8 = 0;
+
+fn process_heap() -> *mut c_void {
+    (&raw const PROCESS_HEAP).cast_mut().cast()
+}
 
 pub fn override_import(_module: &str, name: &str) -> Option<usize> {
     Some(match name {
@@ -77,6 +86,110 @@ pub fn override_import(_module: &str, name: &str) -> Option<usize> {
         //     }
         //     find_proc as usize
         // }
+        "GetProcessHeap" => {
+            extern "win64" fn get_process_heap() -> *mut c_void {
+                process_heap()
+            }
+            get_process_heap as usize
+        }
+        "HeapAlloc" => {
+            extern "win64" fn heap_alloc(_heap: *mut c_void, flags: u32, size: usize) -> *mut c_void {
+                unsafe {
+                    if flags & HEAP_ZERO_MEMORY != 0 {
+                        libc::calloc(1, size)
+                    } else {
+                        libc::malloc(size)
+                    }
+                }
+            }
+            heap_alloc as usize
+        }
+        "HeapFree" => {
+            extern "win64" fn heap_free(_heap: *mut c_void, _flags: u32, mem: *mut c_void) -> i32 {
+                unsafe { libc::free(mem) };
+                1
+            }
+            heap_free as usize
+        }
+        "HeapReAlloc" => {
+            extern "win64" fn heap_realloc(
+                _heap: *mut c_void,
+                flags: u32,
+                mem: *mut c_void,
+                size: usize,
+            ) -> *mut c_void {
+                if flags & HEAP_REALLOC_IN_PLACE_ONLY != 0 {
+                    return null_mut();
+                }
+                unsafe {
+                    let old = libc::malloc_usable_size(mem);
+                    let new = libc::realloc(mem, size);
+                    if !new.is_null() && flags & HEAP_ZERO_MEMORY != 0 && size > old {
+                        libc::memset(new.cast::<u8>().add(old).cast(), 0, size - old);
+                    }
+                    new
+                }
+            }
+            heap_realloc as usize
+        }
+        "HeapSize" => {
+            extern "win64" fn heap_size(_heap: *mut c_void, _flags: u32, mem: *const c_void) -> usize {
+                if mem.is_null() {
+                    return usize::MAX;
+                }
+                unsafe { libc::malloc_usable_size(mem.cast_mut()) }
+            }
+            heap_size as usize
+        }
+        "HeapValidate" => {
+            extern "win64" fn heap_validate(
+                _heap: *mut c_void,
+                _flags: u32,
+                _mem: *const c_void,
+            ) -> i32 {
+                1
+            }
+            heap_validate as usize
+        }
+        "HeapWalk" => {
+            extern "win64" fn heap_walk(_heap: *mut c_void, _entry: *mut c_void) -> i32 {
+                get_tib().set_last_error(ERROR_NO_MORE_ITEMS);
+                0
+            }
+            heap_walk as usize
+        }
+        "HeapQueryInformation" => {
+            extern "win64" fn heap_query_information(
+                _heap: *mut c_void,
+                _class: i32,
+                info: *mut c_void,
+                len: usize,
+                ret_len: *mut usize,
+            ) -> i32 {
+                if !info.is_null() && len >= 4 {
+                    unsafe { info.cast::<u32>().write(0) };
+                }
+                if !ret_len.is_null() {
+                    unsafe { ret_len.write(4) };
+                }
+                1
+            }
+            heap_query_information as usize
+        }
+        "HeapCompact" => {
+            extern "win64" fn heap_compact(_heap: *mut c_void, _flags: u32) -> usize {
+                get_tib().set_last_error(0);
+                0
+            }
+            heap_compact as usize
+        }
+        "LocalFree" => {
+            extern "win64" fn local_free(mem: *mut c_void) -> *mut c_void {
+                unsafe { libc::free(mem) };
+                null_mut()
+            }
+            local_free as usize
+        }
         "InitializeCriticalSectionAndSpinCount" => {
             extern "win64" fn icsasc(cs: *mut (), _sc: u32) -> bool {
                 warn!("todo: threads");
@@ -178,6 +291,12 @@ pub fn override_import(_module: &str, name: &str) -> Option<usize> {
                 null()
             }
             load_lib as usize
+        }
+        "SetLastError" => {
+            extern "win64" fn set_last_error(e: u32) {
+                get_tib().set_last_error(e);
+            }
+            set_last_error as usize
         }
         "GetLastError" => {
             extern "win64" fn get_last_error() -> u32 {
