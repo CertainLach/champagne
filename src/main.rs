@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::mem::{forget, transmute};
 use std::os::fd::AsRawFd;
-use std::ptr::{self, addr_of, null};
+use std::ptr::{addr_of, null};
 use tracing::{debug, info, info_span, trace, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -38,6 +38,7 @@ mod fuckup_cc;
 mod jitreg;
 mod mkstub;
 mod seh;
+mod sync;
 mod winapis;
 mod wininternals;
 
@@ -46,8 +47,14 @@ mod wininternals;
 struct CriticalSection(Option<Box<ReentrantMutex<()>>>);
 #[cfg(not(target_os = "windows"))]
 impl CriticalSection {
+    fn new() -> Self {
+        Self(Some(Box::new(ReentrantMutex::new(()))))
+    }
     fn init(&mut self) {
         self.0 = Some(Box::new(ReentrantMutex::new(())));
+    }
+    fn is_initialized(&self) -> bool {
+        self.0.is_some()
     }
     fn enter(&self) {
         forget(self.0.as_ref().expect("initialized").lock())
@@ -57,6 +64,8 @@ impl CriticalSection {
         self.0.as_ref().expect("initialized").force_unlock()
     }
 }
+
+const DLL_PROCESS_ATTACH: u32 = 1;
 
 trait ExportedFnRaw {
     fn exported_fn_raw(&self, name: &str) -> Result<*const ()>;
@@ -96,8 +105,7 @@ impl PeImage {
         drop(map);
 
         info!("mapped to run = {image:?}, pe = {ro_orig_image:?}");
-        let mut entry =
-            OwnedLdrData::new(full_name, base_name, image.as_ptr().cast(), image.len());
+        let mut entry = OwnedLdrData::new(full_name, base_name, image.as_ptr().cast(), image.len());
         info!("adding to PEB");
         get_tib()
             .get_peb()
@@ -145,7 +153,7 @@ impl PeImage {
 
         Ok(img)
     }
-    fn project(&mut self) -> (PeEditor, PeFile) {
+    fn project(&mut self) -> (PeEditor<'_>, PeFile<'_>) {
         let pe = PeFile::from_bytes(&self.ro_orig_image).expect("validity checked in new()");
         (
             PeEditor {
@@ -275,7 +283,7 @@ impl PeImage {
             ro_orig_image: self.ro_orig_image,
         })
     }
-    fn pe(&self) -> PeFile {
+    fn pe(&self) -> PeFile<'_> {
         let file = PeFile::from_bytes(&self.ro_orig_image)
             .expect("file shouldn't be corrupted during linking");
         file
@@ -310,14 +318,13 @@ impl ExportedFnRaw for FinishedPeImage {
 }
 
 type LinkerData = BTreeMap<String, FinishedPeImage>;
-type LinkerAliases = BTreeMap<String, String>;
 
 struct FinishedPeImage {
     image: Mmap,
     ro_orig_image: Mmap,
 }
 impl FinishedPeImage {
-    fn pe(&self) -> PeFile {
+    fn pe(&self) -> PeFile<'_> {
         let file = PeFile::from_bytes(&self.ro_orig_image)
             .expect("file shouldn't be corrupted during linking");
         file
@@ -329,9 +336,6 @@ impl FinishedPeImage {
     }
     fn mirror<T>(&self, v: &T) -> &T {
         mirror_raw(&self.image, &self.ro_orig_image, &self.pe(), v)
-    }
-    fn mirror_raw<T>(&self, v: *const T) -> *const T {
-        raw_mirror_raw(&self.image, &self.ro_orig_image, &self.pe(), v)
     }
     unsafe fn exported_fn<F: KnownCcFunction>(&self, name: &str) -> Result<F> {
         Ok(unsafe { F::from_ptr(self.exported_fn_raw(name)?) })
@@ -349,17 +353,39 @@ impl FinishedPeImage {
         }
         Ok(())
     }
-    fn call_tls_callbacks(&self) -> Result<()> {
+    fn mapped_va(&self, va: u64) -> usize {
+        let rva = va - self.pe().optional_header().ImageBase;
+        self.image.as_ptr() as usize + rva as usize
+    }
+    fn init_static_tls(&self) -> Result<()> {
         let tls = self.pe().tls();
         if tls.err() == Some(Error::Null) {
-            info!("image has no tls");
+            debug!("image has no tls");
             return Ok(());
         }
         let tls = tls?;
-        let raw = tls.raw_data()?;
-        // let raw = unsafe { slice::from_raw_parts(self.mirror_raw(raw.as_ptr()), raw.len()) };
-        // let mut alloc_tls_data = raw
-        let allocated = raw.to_vec();
+        let image = tls.image();
+        let template = tls.raw_data()?;
+
+        let index = get_tib()
+            .get_peb()
+            .register_tls_template(template, image.SizeOfZeroFill as usize);
+        unsafe { (self.mapped_va(image.AddressOfIndex) as *mut u32).write(index) };
+        debug!(
+            "static tls index {index}, {} bytes",
+            template.len() + image.SizeOfZeroFill as usize
+        );
+
+        for callback in tls.callbacks()? {
+            if *callback == 0 {
+                break;
+            }
+            let callback = self.mapped_va(*callback);
+            debug!("tls callback {callback:#x}");
+            let callback: extern "win64" fn(*const u8, u32, *const u8) =
+                unsafe { transmute(callback) };
+            callback(self.image.as_ptr(), DLL_PROCESS_ATTACH, null());
+        }
         Ok(())
     }
     fn call_ep_if_exists(&self) -> Result<()> {
@@ -407,17 +433,6 @@ fn mirror_raw<'o, T>(mapped_image: &'o [u8], dll_file: &[u8], pe: &PeFile, v: &T
     assert!((rva as usize) < mapped_image.len(), "rva is out of mapping");
     unsafe { &*mapped_image.as_ptr().byte_offset(rva as isize).cast() }
 }
-fn raw_mirror_raw<T>(mapped_image: &Mmap, dll_file: &[u8], pe: &PeFile, v: *const T) -> *const T {
-    let orig = v.cast::<u8>();
-    let offset = unsafe { orig.offset_from(dll_file.as_ptr().cast()) };
-    assert!(
-        offset > 0 && (offset as usize) < dll_file.len(),
-        "can't mirror value not from source dll file"
-    );
-    let rva = pe.file_offset_to_rva(offset as usize).expect("in image");
-    assert!((rva as usize) < mapped_image.len(), "rva is out of mapping");
-    unsafe { &*mapped_image.as_ptr().byte_offset(rva as isize).cast() }
-}
 
 struct PeEditor<'m> {
     mapped_image: &'m mut MmapMut,
@@ -454,6 +469,8 @@ fn main() -> Result<()> {
         m.resolve_imports(override_import, &peb)?;
         let m = m.finish(false)?;
         {
+            m.init_static_tls()?;
+
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
         }
@@ -471,6 +488,8 @@ fn main() -> Result<()> {
         m.resolve_imports(override_import, &peb)?;
         let m = m.finish(false)?;
         {
+            m.init_static_tls()?;
+
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
         }
@@ -487,6 +506,8 @@ fn main() -> Result<()> {
         m.resolve_imports(override_import, &peb)?;
         let m = m.finish(true)?;
         {
+            m.init_static_tls()?;
+
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
         }

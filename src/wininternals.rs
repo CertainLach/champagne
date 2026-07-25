@@ -1,16 +1,18 @@
 use std::alloc::{alloc_zeroed, Layout};
+use std::any::Any;
 use std::arch::asm;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::offset_of;
 use std::mem::MaybeUninit;
-use std::pin;
-use std::pin::pin;
 use std::pin::Pin;
 use std::ptr::null;
 use std::ptr::write_volatile;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::bail;
 use derivative::Derivative;
@@ -19,11 +21,11 @@ use moveit::Emplace;
 use nt_list::list::{NtList, NtListEntry, NtListHead};
 use nt_list::NtListElement;
 use nt_string::unicode_string::NtUnicodeString;
+use parking_lot::Mutex;
 use pelite::pe64::exports::Export;
 use pelite::pe64::exports::GetProcAddress;
 use pelite::pe64::Pe;
 use pelite::pe64::PeView;
-use tracing::debug;
 use tracing::trace;
 
 use crate::CriticalSection;
@@ -87,7 +89,7 @@ pub struct LdrDataEntry {
 }
 impl LdrDataEntry {
     // TODO: x32 support?
-    pub fn pe(&self) -> PeView {
+    pub fn pe(&self) -> PeView<'_> {
         unsafe { PeView::module(self.dll_base.cast()) }
     }
     pub fn base(&self) -> *const () {
@@ -123,16 +125,18 @@ impl LdrDataEntry {
 pub struct OwnedLdrData(*mut UnsafeCell<LdrDataEntry>);
 impl OwnedLdrData {
     pub fn new(
-        full_name: NtUnicodeString,
-        base_name: NtUnicodeString,
-        base: *const (),
+        full_dll_name: NtUnicodeString,
+        base_dll_name: NtUnicodeString,
+        dll_base: *const (),
         size_of_image: usize,
     ) -> Self {
-        let mut data = LdrDataEntry::default();
-        data.full_dll_name = full_name;
-        data.base_dll_name = base_name;
-        data.dll_base = base;
-        data.size_of_image = size_of_image;
+        let data = LdrDataEntry {
+            full_dll_name,
+            base_dll_name,
+            dll_base,
+            size_of_image,
+            ..Default::default()
+        };
         let boxed = Box::new(UnsafeCell::new(data));
         Self(Box::into_raw(boxed))
     }
@@ -216,7 +220,7 @@ impl LdrData {
                 .map_unchecked(|v| v.assume_init_ref())
                 .iter()
         }
-        .find(|e| e.base_dll_name.to_string() == lib)
+        .find(|e| e.base_dll_name == lib)
     }
     pub fn find_by_pc(self: Pin<&Self>, pc: usize) -> Option<&LdrDataEntry> {
         unsafe {
@@ -226,6 +230,47 @@ impl LdrData {
                 .iter()
         }
         .find(|e| e.contains_pc(pc))
+    }
+}
+
+pub struct TlsTemplate {
+    pub data: &'static [u8],
+    pub total_size: usize,
+}
+
+pub struct LoaderPrivate {
+    magic: u64,
+    tls_templates: Mutex<Vec<TlsTemplate>>,
+    objects: Mutex<HashMap<usize, Arc<dyn Any + Send + Sync>>>,
+    next_handle: AtomicUsize,
+}
+
+const LOADER_PRIVATE_MAGIC: u64 = 0x444C4C4C_4F414452;
+
+impl LoaderPrivate {
+    fn new() -> Self {
+        Self {
+            magic: LOADER_PRIVATE_MAGIC,
+            tls_templates: Mutex::new(Vec::new()),
+            objects: Mutex::new(HashMap::new()),
+            next_handle: AtomicUsize::new(0x1000),
+        }
+    }
+    pub fn insert_object(&self, object: Arc<dyn Any + Send + Sync>) -> usize {
+        // Windows handles are multiples of four
+        let handle = self.next_handle.fetch_add(4, Ordering::Relaxed);
+        self.objects.lock().insert(handle, object);
+        handle
+    }
+    pub fn duplicate_object(&self, handle: usize) -> Option<usize> {
+        let object = self.objects.lock().get(&handle).cloned()?;
+        Some(self.insert_object(object))
+    }
+    pub fn get_object(&self, handle: usize) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.objects.lock().get(&handle).cloned()
+    }
+    pub fn remove_object(&self, handle: usize) -> bool {
+        self.objects.lock().remove(&handle).is_some()
     }
 }
 
@@ -270,6 +315,27 @@ pub trait PebLike {
             pin.find_lib(entry)
         }
     }
+    fn private(&self) -> &'static LoaderPrivate {
+        let private = unsafe { (*self.get_ref().0).subsys_data.cast::<LoaderPrivate>() };
+        assert!(!private.is_null(), "peb has no loader private data");
+        let private = unsafe { &*private };
+        assert_eq!(
+            private.magic, LOADER_PRIVATE_MAGIC,
+            "peb SubSystemData was overwritten by the guest"
+        );
+        private
+    }
+    fn register_tls_template(&self, data: &[u8], zero_fill: usize) -> u32 {
+        let private = self.private();
+        let mut templates = private.tls_templates.lock();
+        let index = templates.len() as u32;
+        templates.push(TlsTemplate {
+            data: Box::leak(data.to_vec().into_boxed_slice()),
+            total_size: data.len() + zero_fill,
+        });
+        get_tib().materialize_tls(&templates);
+        index
+    }
     // In windows this is unsynchronized, and thus may cause segfault.
     fn find_entry_by_pc(&self, pc: usize) -> Option<&LdrDataEntry> {
         unsafe {
@@ -287,9 +353,12 @@ impl VirtualPeb {
         unsafe {
             peb.ldr = Box::into_raw(Pin::into_inner_unchecked(Box::emplace(LdrData::new())));
             peb.fast_peb_lock = Box::into_raw(Box::new(mem::zeroed()));
+            peb.subsys_data = Box::into_raw(Box::new(LoaderPrivate::new())).cast();
 
             (*peb.fast_peb_lock).init();
         }
+        // Slot 0 is reserved, as ntdll does in LdrpInitializeProcess.
+        peb.tls_bitmap_bits[0] = 1;
 
         let boxed = Box::new(UnsafeCell::new(peb));
         Self(boxed)
@@ -299,7 +368,7 @@ impl VirtualPeb {
     }
 }
 impl PebLike for VirtualPeb {
-    fn lock(&self) -> LockedPeb {
+    fn lock(&self) -> LockedPeb<'_> {
         unsafe { (*(*self.0.get()).fast_peb_lock).enter() };
         LockedPeb(unsafe { &mut *self.0.get() }, PhantomData)
     }
@@ -309,7 +378,7 @@ impl PebLike for VirtualPeb {
 }
 pub struct PebRef(*const Peb);
 impl PebLike for PebRef {
-    fn lock(&self) -> LockedPeb {
+    fn lock(&self) -> LockedPeb<'_> {
         unsafe { (*(*self.0).fast_peb_lock).enter() };
         LockedPeb(unsafe { &mut *self.0.cast_mut() }, PhantomData)
     }
@@ -394,7 +463,7 @@ impl VirtualTib<'_> {
             Box::from_raw(alloc_zeroed(layout).cast())
         };
         boxed.get_mut().this = boxed.get();
-        boxed.get_mut().tls = 0xfafafafausize as *const ();
+        boxed.get_mut().tls = null();
         boxed.get_mut().peb = peb.as_ptr();
         Self(boxed, PhantomData)
     }
@@ -425,6 +494,26 @@ impl TibRef {
     }
     pub fn get_peb(&self) -> PebRef {
         PebRef(unsafe { (*self.0.get()).peb })
+    }
+    fn materialize_tls(&self, templates: &[TlsTemplate]) {
+        let existing = unsafe { (*self.0.get()).tls }.cast::<usize>();
+        let mut array = Vec::with_capacity(templates.len());
+        for (index, template) in templates.iter().enumerate() {
+            let existing = if existing.is_null() {
+                0
+            } else {
+                unsafe { existing.add(index).read() }
+            };
+            if existing != 0 {
+                array.push(existing);
+                continue;
+            }
+            let mut block = vec![0u8; template.total_size].into_boxed_slice();
+            block[..template.data.len()].copy_from_slice(template.data);
+            array.push(Box::leak(block).as_mut_ptr() as usize);
+        }
+        let array = Box::leak(array.into_boxed_slice());
+        unsafe { (*self.0.get()).tls = array.as_mut_ptr().cast() };
     }
     pub fn tls_get(&self, index: u32) -> Option<*mut c_void> {
         unsafe { (*self.0.get()).tls_slots.get(index as usize).copied() }

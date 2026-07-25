@@ -7,6 +7,7 @@ use std::ptr::{null, null_mut};
 use std::slice;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use tracing::{debug, info, warn};
 
 use crate::wininternals::{get_tib, PebLike, TLS_OUT_OF_INDEXES};
@@ -28,6 +29,7 @@ const INVALID_HANDLE_VALUE: usize = usize::MAX;
 const FILE_TYPE_UNKNOWN: u32 = 0;
 const FILE_TYPE_CHAR: u32 = 2;
 const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
+const TIME_ZONE_ID_UNKNOWN: u32 = 0;
 const CP_UTF8: u32 = 65001;
 const LCID_EN_US: u32 = 0x0409;
 const LOCALE_USER_DEFAULT: u32 = 0x0400;
@@ -727,25 +729,6 @@ winfn! {
 }
 
 winfn! {
-    fn InitializeCriticalSectionAndSpinCount(cs: *mut (), _sc: u32) -> i32 {
-        warn!("todo: threads");
-        // *cs = unsafe {Mutex::new(());};
-        let _ = cs;
-        1
-    }
-
-    fn DeleteCriticalSection(_cs: *mut ()) {
-        warn!("todo: threads");
-    }
-
-    fn EnterCriticalSection(_cs: *mut ()) {
-        warn!("todo: threads");
-    }
-
-    fn LeaveCriticalSection(_cs: *mut ()) {
-        warn!("todo: threads");
-    }
-
     fn InitializeSListHead(head: *mut *mut c_void) {
         if !head.is_null() {
             unsafe { head.write_bytes(0, 2) };
@@ -791,7 +774,123 @@ winfn! {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SystemTimeW {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+const _: () = assert!(size_of::<SystemTimeW>() == 16);
+
+#[repr(C)]
+struct TimeZoneInformation {
+    bias: i32,
+    standard_name: [u16; 32],
+    standard_date: SystemTimeW,
+    standard_bias: i32,
+    daylight_name: [u16; 32],
+    daylight_date: SystemTimeW,
+    daylight_bias: i32,
+}
+const _: () = assert!(size_of::<TimeZoneInformation>() == 172);
+
+fn system_time_from_unix(secs: i64, milliseconds: u16) -> SystemTimeW {
+    let at = OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    SystemTimeW {
+        year: at.year() as u16,
+        month: u8::from(at.month()) as u16,
+        day_of_week: at.weekday().number_days_from_sunday() as u16,
+        day: at.day() as u16,
+        hour: at.hour() as u16,
+        minute: at.minute() as u16,
+        second: at.second() as u16,
+        milliseconds,
+    }
+}
+
+fn unix_from_system_time(at: &SystemTimeW) -> Option<i64> {
+    let date = Date::from_calendar_date(
+        at.year as i32,
+        Month::try_from(at.month as u8).ok()?,
+        at.day as u8,
+    )
+    .ok()?;
+    let time = Time::from_hms(at.hour as u8, at.minute as u8, at.second as u8).ok()?;
+    Some(PrimitiveDateTime::new(date, time).assume_utc().unix_timestamp())
+}
+
+fn now_unix() -> (i64, u16) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.as_secs() as i64, now.subsec_millis() as u16)
+}
+
 winfn! {
+    #[alias("GetSystemTime")]
+    fn GetLocalTime(out: *mut SystemTimeW) {
+        if out.is_null() {
+            return;
+        }
+        let (secs, millis) = now_unix();
+        unsafe { out.write(system_time_from_unix(secs, millis)) };
+    }
+
+    fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32 {
+        if !info.is_null() {
+            unsafe { info.write_bytes(0, 1) };
+        }
+        TIME_ZONE_ID_UNKNOWN
+    }
+
+    fn SystemTimeToFileTime(time: *const SystemTimeW, out: *mut u64) -> i32 {
+        if time.is_null() || out.is_null() {
+            get_tib().set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let time = unsafe { &*time };
+        let Some(secs) = unix_from_system_time(time) else {
+            get_tib().set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        };
+        let ticks = (secs + SECONDS_1601_TO_1970 as i64) * 10_000_000
+            + time.milliseconds as i64 * 10_000;
+        unsafe { out.write_unaligned(ticks as u64) };
+        1
+    }
+
+    fn FileTimeToSystemTime(file_time: *const u64, out: *mut SystemTimeW) -> i32 {
+        if file_time.is_null() || out.is_null() {
+            get_tib().set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let ticks = unsafe { file_time.read_unaligned() };
+        let secs = (ticks / 10_000_000) as i64 - SECONDS_1601_TO_1970 as i64;
+        let millis = (ticks % 10_000_000 / 10_000) as u16;
+        unsafe { out.write(system_time_from_unix(secs, millis)) };
+        1
+    }
+
+    #[alias("TzSpecificLocalTimeToSystemTime")]
+    fn SystemTimeToTzSpecificLocalTime(
+        _zone: *const TimeZoneInformation,
+        input: *const SystemTimeW,
+        out: *mut SystemTimeW,
+    ) -> i32 {
+        if input.is_null() || out.is_null() {
+            get_tib().set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        unsafe { out.write(*input) };
+        1
+    }
+
     fn GetSystemTimeAsFileTime(out: *mut u64) {
         if out.is_null() {
             return;

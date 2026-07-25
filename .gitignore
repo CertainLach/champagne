@@ -3,3 +3,6 @@ LibLensDistortion.dll
 libs
 pelite
 target
+
+/.direnv
+/idc
