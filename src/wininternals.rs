@@ -90,6 +90,9 @@ impl LdrDataEntry {
     pub fn pe(&self) -> PeView {
         unsafe { PeView::module(self.dll_base.cast()) }
     }
+    pub fn base(&self) -> *const () {
+        self.dll_base
+    }
     pub fn exported_fn_raw(&self, name: &str) -> anyhow::Result<*const ()> {
         trace!("looking up export: {name}");
         let p = self.pe();
