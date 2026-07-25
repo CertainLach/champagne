@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr::null;
 use std::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use crate::wininternals::get_tib;
 

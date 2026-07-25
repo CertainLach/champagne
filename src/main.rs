@@ -1,4 +1,4 @@
-#![feature(pointer_byte_offsets, thread_local)]
+// #![feature(pointer_byte_offsets, thread_local)]
 
 use anyhow::{bail, ensure, Context, Result};
 use libc::ftruncate;
@@ -6,6 +6,9 @@ use memmap2::{Mmap, MmapMut, MmapOptions};
 use nix::fcntl::OFlag;
 use nix::sys::mman::shm_open;
 use nix::sys::stat::Mode;
+use nt_string::nt_unicode_str;
+use nt_string::unicode_string::NtUnicodeString;
+use parking_lot::ReentrantMutex;
 use pelite::image::{
     IMAGE_REL_BASED_ABSOLUTE, IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW,
     IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
@@ -18,16 +21,15 @@ use pelite::Error;
 use region::Protection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::mem::transmute;
-use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
+use std::mem::{forget, transmute};
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::ptr::{self, addr_of, null};
-use std::slice;
 use tracing::{debug, info, info_span, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::mkstub::make_stub;
 use crate::winapis::override_import;
-use crate::wininternals::LinuxTib;
+use crate::wininternals::{get_tib, OwnedLdrData, PebLike, VirtualPeb, VirtualTib};
 
 use self::fuckup_cc::KnownCcFunction;
 use self::jitreg::register_jit_code;
@@ -38,6 +40,23 @@ mod mkstub;
 mod winapis;
 mod wininternals;
 
+#[cfg(not(target_os = "windows"))]
+#[repr(C)]
+struct CriticalSection(Option<Box<ReentrantMutex<()>>>);
+#[cfg(not(target_os = "windows"))]
+impl CriticalSection {
+    fn init(&mut self) {
+        self.0 = Some(Box::new(ReentrantMutex::new(())));
+    }
+    fn enter(&self) {
+        forget(self.0.as_ref().expect("initialized").lock())
+    }
+    /// SAFETY: CS should be entered
+    unsafe fn leave(&self) {
+        self.0.as_ref().expect("initialized").force_unlock()
+    }
+}
+
 trait ExportedFnRaw {
     fn exported_fn_raw(&self, name: &str) -> Result<*const ()>;
 }
@@ -46,15 +65,16 @@ struct PeImage {
     image: MmapMut,
     ro_orig_image: Mmap,
     resolved_inputs: bool,
+    ldr: OwnedLdrData,
 }
 impl PeImage {
-    fn new(name: &str, file: File) -> Result<Self> {
+    fn new(full_name: NtUnicodeString, base_name: NtUnicodeString, file: File) -> Result<Self> {
         let ro_orig_image = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
         let pe = PeFile::from_bytes(&ro_orig_image).context("pe validity check")?;
         let pe_data = pe.to_view();
 
         let map = shm_open(
-            format!("mapped:{name}").as_str(),
+            format!("mapped").as_str(),
             OFlag::O_RDWR | OFlag::O_CREAT,
             Mode::S_IRWXU,
         )
@@ -64,10 +84,17 @@ impl PeImage {
         image.copy_from_slice(&pe_data);
 
         info!("mapped to run = {image:?}, pe = {ro_orig_image:?}");
+        let mut entry = OwnedLdrData::new(full_name, base_name, image.as_ptr().cast());
+        info!("adding to PEB");
+        get_tib()
+            .get_peb()
+            .lock()
+            .add_entry(entry.unchecked_get_pinned());
         let mut img = Self {
             image,
             ro_orig_image,
             resolved_inputs: false,
+            ldr: entry,
         };
 
         'rebase: {
@@ -101,6 +128,7 @@ impl PeImage {
                 }
             }
         }
+        // get_tib().get_peb().lock();
 
         Ok(img)
     }
@@ -118,7 +146,7 @@ impl PeImage {
     fn resolve_imports(
         &mut self,
         default: fn(&str, &str) -> Option<usize>,
-        linker: &LinkerData,
+        linker: &dyn PebLike,
     ) -> Result<()> {
         let (mut editor, data) = self.project();
         let imports = data.imports();
@@ -147,13 +175,16 @@ impl PeImage {
                         let new = editor.mut_mirror(iat);
                         let mut dllstr = dll.to_str().expect("module not utf8").to_lowercase();
                         if dllstr.starts_with("api-ms-win-") {
+                            warn!("rewriting {dllstr} => ucrtbase.dll");
                             dllstr = "ucrtbase.dll".to_owned();
                         }
+                        trace!("import {dllstr}.{name:?}");
                         let namestr = name.to_str().expect("import not utf8");
                         *new = match default(&dllstr, namestr) {
                             Some(v) => v as u64,
                             None => {
-                                if let Some(dll) = linker.get(&dllstr) {
+                                if let Some(dll) = linker.find_entry(&dllstr) {
+                                    debug!("found {dllstr}");
                                     match dll.exported_fn_raw(namestr) {
                                         Ok(fun) => fun as u64,
                                         Err(e) => {
@@ -223,6 +254,7 @@ impl PeImage {
         }
         // if jit {
         register_jit_code(exec.as_ptr().cast(), exec.len() as u64);
+
         // }
 
         Ok(FinishedPeImage {
@@ -405,15 +437,22 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    let peb = VirtualPeb::new();
+
     let mut data = LinkerData::new();
-    let tib = LinuxTib::new();
+    let tib = VirtualTib::new(&peb);
     for lib in ["ucrtbase.dll", "vcruntime140.dll", "msvcp140.dll"] {
+        let _ent_tib = tib.enter();
         let _span = info_span!("lib", lib = lib).entered();
-        let mut m = PeImage::new(lib, File::open(format!("libs/{lib}"))?)?;
-        m.resolve_imports(override_import, &data)?;
+        let mut full = NtUnicodeString::new();
+        let mut base = NtUnicodeString::new();
+        full.try_push_str("libs/").expect("valid");
+        full.try_push_str(lib).expect("lib name is valid");
+        base.try_push_str(lib).expect("lib name is valid");
+        let mut m = PeImage::new(full, base, File::open(format!("libs/{lib}"))?)?;
+        m.resolve_imports(override_import, &peb)?;
         let m = m.finish(false)?;
         {
-            let _ent_tib = tib.enter();
             m.init_cookie()?;
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
@@ -422,12 +461,16 @@ fn main() -> Result<()> {
     }
     //, "api-ms-win-crt-string-l1-1-0.dll"
     {
+        let _ent_tib = tib.enter();
         let _span = info_span!("opencv_world").entered();
-        let mut m = PeImage::new("opencv_world", File::open("opencv_world346.dll")?)?;
-        m.resolve_imports(override_import, &data)?;
+        let mut m = PeImage::new(
+            (&nt_unicode_str!("opencv_world.dll")).into(),
+            (&nt_unicode_str!("opencv_world.dll")).into(),
+            File::open("opencv_world346.dll")?,
+        )?;
+        m.resolve_imports(override_import, &peb)?;
         let m = m.finish(false)?;
         {
-            let _ent_tib = tib.enter();
             m.init_cookie()?;
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
@@ -435,17 +478,22 @@ fn main() -> Result<()> {
         data.insert("opencv_world346.dll".to_owned(), m);
     }
     {
+        let _ent_tib = tib.enter();
         let _span = info_span!("libdistort").entered();
-        let mut m = PeImage::new("libdistort", File::open("LibLensDistortion.dll")?)?;
-        m.resolve_imports(override_import, &data)?;
+        let mut m = PeImage::new(
+            (&nt_unicode_str!("a/libdistort.dll")).into(),
+            (&nt_unicode_str!("libdistort.dll")).into(),
+            File::open("LibLensDistortion.dll")?,
+        )?;
+        m.resolve_imports(override_import, &peb)?;
         let m = m.finish(true)?;
         {
-            let _ent_tib = tib.enter();
             m.init_cookie()?;
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
         }
 
+        let _ent_tib = tib.enter();
         unsafe {
             let init_fn = m.exported_fn::<unsafe extern "win64" fn() -> u32>("init")?;
             info!("calling init...");

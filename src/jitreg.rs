@@ -44,7 +44,7 @@ pub fn register_jit_code(code_ptr: *const c_void, code_size: u64) {
     }));
 
     info!("registering jitted code at {code_ptr:?}");
-    unsafe {
+    /*unsafe {
         if __jit_debug_descriptor.first_entry.is_null() {
             __jit_debug_descriptor.first_entry = entry;
         } else {
@@ -67,6 +67,6 @@ pub fn register_jit_code(code_ptr: *const c_void, code_size: u64) {
 
         // Inform debugger
         __jit_debug_register_code();
-    }
+    }*/
     info!("debugger informed");
 }
