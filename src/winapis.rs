@@ -1,9 +1,10 @@
 use std::ffi::{c_char, c_void, CStr};
-use std::ptr::null;
-use std::sync::Mutex;
-use tracing::{info, warn, debug};
+use std::ptr::{null, null_mut};
+use tracing::{debug, info, warn};
 
-use crate::wininternals::get_tib;
+use crate::wininternals::{get_tib, PebLike, TLS_OUT_OF_INDEXES};
+
+const ERROR_INVALID_PARAMETER: u32 = 87;
 
 pub fn override_import(_module: &str, name: &str) -> Option<usize> {
     Some(match name {
@@ -104,10 +105,60 @@ pub fn override_import(_module: &str, name: &str) -> Option<usize> {
         }
         "TlsAlloc" => {
             extern "win64" fn alloc() -> u32 {
-                warn!("todo: tls");
-                u32::MAX
+                let index = get_tib().get_peb().lock().tls_alloc();
+                match index {
+                    Some(index) => {
+                        debug!("tls alloc: {index}");
+                        index
+                    }
+                    None => {
+                        warn!("tls out of indexes");
+                        TLS_OUT_OF_INDEXES
+                    }
+                }
             }
             alloc as usize
+        }
+        "TlsFree" => {
+            extern "win64" fn free(index: u32) -> i32 {
+                let tib = get_tib();
+                if !tib.get_peb().lock().tls_free(index) {
+                    warn!("tls free of unallocated index: {index}");
+                    return 0;
+                }
+                tib.tls_set(index, null_mut());
+                1
+            }
+            free as usize
+        }
+        "TlsGetValue" => {
+            extern "win64" fn get(index: u32) -> *mut c_void {
+                let tib = get_tib();
+                match tib.tls_get(index) {
+                    Some(value) => {
+                        tib.set_last_error(0);
+                        value
+                    }
+                    None => {
+                        warn!("tls get of out of range index: {index}");
+                        tib.set_last_error(ERROR_INVALID_PARAMETER);
+                        null_mut()
+                    }
+                }
+            }
+            get as usize
+        }
+        "TlsSetValue" => {
+            extern "win64" fn set(index: u32, value: *mut c_void) -> i32 {
+                let tib = get_tib();
+                if !tib.tls_set(index, value) {
+                    warn!("tls set of out of range index: {index}");
+                    tib.set_last_error(ERROR_INVALID_PARAMETER);
+                    return 0;
+                }
+                1
+            }
+            set as usize
         }
         "LoadLibraryExW" => {
             extern "win64" fn load_lib(name: *const u16, file: *const (), flags: u32) -> *const () {

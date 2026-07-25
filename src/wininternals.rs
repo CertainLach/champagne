@@ -1,7 +1,10 @@
+use std::alloc::{alloc_zeroed, Layout};
 use std::arch::asm;
 use std::cell::UnsafeCell;
+use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem;
+use std::mem::offset_of;
 use std::mem::MaybeUninit;
 use std::pin;
 use std::pin::pin;
@@ -198,6 +201,9 @@ impl LdrData {
     }
 }
 
+pub const TLS_MINIMUM_AVAILABLE: usize = 64;
+pub const TLS_OUT_OF_INDEXES: u32 = 0xFFFFFFFF;
+
 #[repr(C)]
 pub struct Peb {
     r1: [u8; 4],
@@ -212,7 +218,16 @@ pub struct Peb {
     cpflags: u32,
     r3: [u8; 4],
     user_pointer: *const (),
+    system_reserved: u32,
+    atl_thunk_slist_ptr32: u32,
+    api_set_map: *const (),
+    tls_expansion_counter: u32,
+    r4: [u8; 4],
+    tls_bitmap: *const (),
+    tls_bitmap_bits: [u32; 2],
 }
+const _: () = assert!(offset_of!(Peb, ldr) == 0x18);
+const _: () = assert!(offset_of!(Peb, tls_bitmap_bits) == 0x80);
 unsafe impl Send for Peb {}
 unsafe impl Sync for Peb {}
 pub trait PebLike {
@@ -278,6 +293,30 @@ impl LockedPeb<'_> {
         let ldr = unsafe { Pin::new_unchecked(&mut (*(*self.0).ldr.cast_mut())) };
         ldr.add_initialized(entry)
     }
+    fn tls_bits(&mut self) -> u64 {
+        let bits = unsafe { (*self.0).tls_bitmap_bits };
+        bits[0] as u64 | (bits[1] as u64) << 32
+    }
+    fn set_tls_bits(&mut self, v: u64) {
+        unsafe { (*self.0).tls_bitmap_bits = [v as u32, (v >> 32) as u32] };
+    }
+    pub fn tls_alloc(&mut self) -> Option<u32> {
+        let bits = self.tls_bits();
+        let index = (!bits).trailing_zeros();
+        if index as usize >= TLS_MINIMUM_AVAILABLE {
+            return None;
+        }
+        self.set_tls_bits(bits | 1 << index);
+        Some(index)
+    }
+    pub fn tls_free(&mut self, index: u32) -> bool {
+        let bits = self.tls_bits();
+        if index as usize >= TLS_MINIMUM_AVAILABLE || bits & 1 << index == 0 {
+            return false;
+        }
+        self.set_tls_bits(bits & !(1 << index));
+        true
+    }
 }
 impl Drop for LockedPeb<'_> {
     fn drop(&mut self) {
@@ -302,16 +341,22 @@ struct TibNtrnl {
     peb: *const Peb,
     last_error: u32,
     critical_sections: u32,
+    reserved: [u8; 0x1480 - 0x70],
+    tls_slots: [*mut c_void; TLS_MINIMUM_AVAILABLE],
 }
+const _: () = assert!(offset_of!(TibNtrnl, peb) == 0x60);
+const _: () = assert!(offset_of!(TibNtrnl, tls_slots) == 0x1480);
 pub struct VirtualTib<'peb>(
     Box<UnsafeCell<TibNtrnl>>,
     PhantomData<(&'peb VirtualPeb, *const ())>,
 );
 impl VirtualTib<'_> {
     pub fn new(peb: &VirtualPeb) -> Self {
-        // Is POD
-        let ntrnl: TibNtrnl = unsafe { mem::zeroed() };
-        let mut boxed = Box::new(UnsafeCell::new(ntrnl));
+        // Is POD, allocated zeroed to keep the full TEB off the stack
+        let mut boxed: Box<UnsafeCell<TibNtrnl>> = unsafe {
+            let layout = Layout::new::<UnsafeCell<TibNtrnl>>();
+            Box::from_raw(alloc_zeroed(layout).cast())
+        };
         boxed.get_mut().this = boxed.get();
         boxed.get_mut().tls = 0xfafafafausize as *const ();
         boxed.get_mut().peb = peb.as_ptr();
@@ -344,6 +389,18 @@ impl TibRef {
     }
     pub fn get_peb(&self) -> PebRef {
         PebRef(unsafe { (*self.0.get()).peb })
+    }
+    pub fn tls_get(&self, index: u32) -> Option<*mut c_void> {
+        unsafe { (*self.0.get()).tls_slots.get(index as usize).copied() }
+    }
+    pub fn tls_set(&self, index: u32, value: *mut c_void) -> bool {
+        match unsafe { (*self.0.get()).tls_slots.get_mut(index as usize) } {
+            Some(slot) => {
+                *slot = value;
+                true
+            }
+            None => false,
+        }
     }
 }
 

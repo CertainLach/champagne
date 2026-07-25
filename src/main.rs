@@ -334,21 +334,6 @@ impl FinishedPeImage {
     unsafe fn exported_fn<F: KnownCcFunction>(&self, name: &str) -> Result<F> {
         Ok(unsafe { F::from_ptr(self.exported_fn_raw(name)?) })
     }
-    fn init_cookie(&self) -> Result<()> {
-        let cookie = self.pe().load_config();
-        if cookie.err() == Some(Error::Null) {
-            info!("image has no load config");
-            return Ok(());
-        }
-        info!("initializing security cookie");
-        let cookie = cookie?.security_cookie()?;
-        let cookie = self.mirror_raw(cookie);
-        // Security cookie should be located in RW section, so it is a safe cast
-        let cookie = cookie.cast_mut();
-        // Looks pretty random to me
-        unsafe { ptr::write_volatile(cookie, 0xDEADBEEF) };
-        Ok(())
-    }
     fn init_exceptions(&self) -> Result<()> {
         let exc = self.pe().exception();
         if exc.err() == Some(Error::Null) {
@@ -385,7 +370,10 @@ impl FinishedPeImage {
             self.assert_in_image(ep);
             debug!("ep found: {ep:?}, calling it");
             let ep: extern "win64" fn(*const u8, u32, *const u8) -> i32 = unsafe { transmute(ep) };
-            ep(self.image.as_ptr(), 1, null());
+            let ret = ep(self.image.as_ptr(), 1, null());
+            if ret == 0 {
+                bail!("DLL_PROCESS_ATTACH failed");
+            }
         }
         Ok(())
     }
@@ -464,7 +452,6 @@ fn main() -> Result<()> {
         m.resolve_imports(override_import, &peb)?;
         let m = m.finish(false)?;
         {
-            m.init_cookie()?;
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
         }
@@ -482,7 +469,6 @@ fn main() -> Result<()> {
         m.resolve_imports(override_import, &peb)?;
         let m = m.finish(false)?;
         {
-            m.init_cookie()?;
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
         }
@@ -499,7 +485,6 @@ fn main() -> Result<()> {
         m.resolve_imports(override_import, &peb)?;
         let m = m.finish(true)?;
         {
-            m.init_cookie()?;
             m.init_exceptions()?;
             m.call_ep_if_exists()?;
         }
