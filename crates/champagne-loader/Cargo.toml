@@ -1,0 +1,21 @@
+[package]
+name = "champagne-loader"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
+champagne-kernel.workspace = true
+cranelift.workspace = true
+cranelift-codegen.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+memmap2.workspace = true
+nix.workspace = true
+nt-string.workspace = true
+pelite.workspace = true
+region.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

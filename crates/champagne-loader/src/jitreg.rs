@@ -1,8 +1,7 @@
-use std::arch::asm;
 use std::os::raw::c_void;
-use std::{process, ptr};
+use std::ptr;
 
-use tracing::{error, info};
+use tracing::info;
 
 #[repr(C)]
 struct JitCodeEntry {
@@ -20,11 +19,11 @@ pub struct JitDescriptor {
     first_entry: *const JitCodeEntry,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 extern "C" fn __jit_debug_register_code() {}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static mut __jit_debug_descriptor: JitDescriptor = JitDescriptor {
     version: 1,
     action_flag: 0,

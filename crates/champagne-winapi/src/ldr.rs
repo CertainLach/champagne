@@ -1,0 +1,182 @@
+use std::collections::HashMap;
+use std::ffi::{CStr, c_char, c_void};
+use std::iter::once;
+use std::ptr::{null, null_mut};
+use std::sync::OnceLock;
+
+use champagne_kernel::peb::{PebLike as _, get_peb};
+use champagne_loader::ExportedFnRaw as _;
+use champagne_macros::winfn;
+use tracing::{debug, warn};
+use widestring::U16CStr;
+
+use crate::WinFn;
+use crate::peb::{
+	ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MOD_NOT_FOUND, ERROR_PROC_NOT_FOUND,
+	SetLastError,
+};
+
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+
+static KERNEL32_MODULE: u8 = 0;
+static MAIN_MODULE: u8 = 0;
+
+fn main_module_handle() -> *mut c_void {
+	(&raw const MAIN_MODULE).cast_mut().cast()
+}
+
+fn kernel32_handle() -> *mut c_void {
+	(&raw const KERNEL32_MODULE).cast_mut().cast()
+}
+
+fn module_handle_from_address(address: *const c_void) -> Option<*mut c_void> {
+	let peb = get_peb();
+	let entry = peb.find_entry_by_pc(address as usize)?;
+	Some(entry.base().cast_mut().cast())
+}
+
+fn module_handle(name: &str) -> Option<*mut c_void> {
+	let lowered = name.to_lowercase();
+	let stem = lowered.strip_suffix(".dll").unwrap_or(&lowered);
+	let peb = get_peb();
+	if let Some(entry) = peb.find_entry(&format!("{stem}.dll")) {
+		return Some(entry.base().cast_mut().cast());
+	}
+	if matches!(stem, "kernel32" | "kernelbase" | "ntdll") {
+		return Some(kernel32_handle());
+	}
+	None
+}
+pub fn override_import(_module: &str, name: &str) -> Option<usize> {
+	static TABLE: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
+	TABLE
+		.get_or_init(|| {
+			inventory::iter::<WinFn>
+				.into_iter()
+				.map(|f| (f.name, (f.ptr)()))
+				.collect()
+		})
+		.get(name)
+		.copied()
+}
+
+#[winfn]
+#[alias(LoadLibraryW)]
+fn LoadLibraryExW(name: *const u16, _file: *const (), _flags: u32) -> *const () {
+	if name.is_null() {
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return null();
+	}
+	let name = unsafe { U16CStr::from_ptr_str(name) }.to_string_lossy();
+	let stem = name.rsplit(['\\', '/']).next().unwrap_or(&name);
+	match module_handle(stem) {
+		Some(handle) => {
+			debug!("dyn load of already mapped {stem}");
+			handle.cast()
+		}
+		None => {
+			warn!("dyn load of unmapped {stem}, reporting failure");
+			SetLastError(ERROR_MOD_NOT_FOUND);
+			null()
+		}
+	}
+}
+
+#[winfn]
+fn GetProcAddress(module: *const (), proc: *const c_char) -> *const () {
+	if (proc as usize) < 0x10000 {
+		warn!("get proc by ordinal #{}: unsupported", proc as usize);
+		SetLastError(ERROR_PROC_NOT_FOUND);
+		return null();
+	}
+	let Ok(name) = (unsafe { CStr::from_ptr(proc) }).to_str() else {
+		SetLastError(ERROR_PROC_NOT_FOUND);
+		return null();
+	};
+	let peb = get_peb();
+	if let Some(entry) = peb.find_entry_by_pc(module as usize) {
+		if let Ok(ptr) = entry.exported_fn_raw(name) {
+			debug!("get proc: {name} => {}", entry.base_name());
+			return ptr;
+		}
+	} else if module == kernel32_handle().cast_const().cast() {
+		// Only the synthetic system module exports the builtins; resolving
+		// them against an arbitrary handle would invent exports a real
+		// module does not have.
+		if let Some(ptr) = override_import("kernel32.dll", name) {
+			debug!("get proc: {name} => builtin");
+			return ptr as *const ();
+		}
+	}
+	warn!("get proc not found: {name}");
+	SetLastError(ERROR_PROC_NOT_FOUND);
+	null()
+}
+
+#[winfn]
+fn GetModuleFileNameW(_module: *mut c_void, buf: *mut u16, size: u32) -> u32 {
+	static NAME: OnceLock<Vec<u16>> = OnceLock::new();
+	let name = NAME.get_or_init(|| r"C:\dllloader.exe".encode_utf16().chain(once(0)).collect());
+	if buf.is_null() || size == 0 {
+		return 0;
+	}
+	let copy = name.len().min(size as usize);
+	unsafe { buf.copy_from_nonoverlapping(name.as_ptr(), copy) };
+	// Truncation only happens when the name with its terminator does not
+	// fit; an exact fit is a success, otherwise the usual grow-the-buffer
+	// loop never terminates.
+	if name.len() > size as usize {
+		unsafe { buf.add(copy - 1).write(0) };
+		SetLastError(ERROR_INSUFFICIENT_BUFFER);
+		return size;
+	}
+	copy as u32 - 1
+}
+
+#[winfn]
+fn GetModuleHandleW(name: *const u16) -> *mut c_void {
+	if name.is_null() {
+		return main_module_handle();
+	}
+	let name = unsafe { widestring::U16CStr::from_ptr_str(name) }.to_string_lossy();
+	match module_handle(&name) {
+		Some(handle) => handle,
+		None => {
+			warn!("module not found: {name}");
+			SetLastError(ERROR_MOD_NOT_FOUND);
+			null_mut()
+		}
+	}
+}
+
+#[winfn]
+fn GetModuleHandleExW(flags: u32, name: *const u16, out: *mut *mut c_void) -> i32 {
+	if out.is_null() {
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return 0;
+	}
+	if name.is_null() {
+		unsafe { out.write(main_module_handle()) };
+		return 1;
+	}
+	// With this flag the argument is an address inside the module, not a
+	// string, so it must never be read as one.
+	let found = if flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0 {
+		module_handle_from_address(name.cast())
+	} else {
+		let name = unsafe { widestring::U16CStr::from_ptr_str(name) }.to_string_lossy();
+		module_handle(&name)
+	};
+	match found {
+		Some(handle) => {
+			unsafe { out.write(handle) };
+			1
+		}
+		None => {
+			warn!("module not found for GetModuleHandleEx, flags {flags:#x}");
+			unsafe { out.write(null_mut()) };
+			SetLastError(ERROR_MOD_NOT_FOUND);
+			0
+		}
+	}
+}

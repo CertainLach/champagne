@@ -1,0 +1,17 @@
+[package]
+name = "champagne-kernel"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
+derivative.workspace = true
+libc.workspace = true
+moveit.workspace = true
+nt-list.workspace = true
+nt-string.workspace = true
+parking_lot.workspace = true
+pelite.workspace = true
+pin-project.workspace = true
+tracing.workspace = true

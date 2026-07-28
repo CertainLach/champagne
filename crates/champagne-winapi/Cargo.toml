@@ -1,0 +1,16 @@
+[package]
+name = "champagne-winapi"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
+champagne-kernel.workspace = true
+champagne-loader.workspace = true
+champagne-macros.workspace = true
+inventory.workspace = true
+libc.workspace = true
+time.workspace = true
+tracing.workspace = true
+widestring.workspace = true

@@ -1,0 +1,12 @@
+= champagne
+
+Champagne: Hostile Acquisition of Microsoft PE, Annexed by GNU/Native ELF (Placeholder acronym, TBD, IDK)
+
+== Structure
+
+NOTE: This is how I imagine it should be implemented, right now it is a mess, and given that windows api themselves are mess it might not work as I intend.
+
+champagne-kernel:: Definitions of core windows process structures that are directly compatible with windows, and should be usable on windows, and virtual implementations of them for linux and other purposes.
+champagne-loader:: Low-level manual mapper on top of champagne-kernel
+champagne-winapi:: Implementation of common kernel32 functions on top of kernel structures, should be useless on windows for purposes other than replacing LoadLibrary etc calls with those that perform searches using its own defs.
+champagne:: Top-level wrapper crate, which should have somewhat usable api.

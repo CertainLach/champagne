@@ -1,0 +1,34 @@
+[package]
+name = "champagne"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+memmap2.workspace = true
+nix.workspace = true
+nt-string.workspace = true
+pelite.workspace = true
+region.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+cranelift.workspace = true
+cranelift-codegen.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+inventory.workspace = true
+parking_lot.workspace = true
+widestring.workspace = true
+time.workspace = true
+derivative.workspace = true
+moveit.workspace = true
+nt-list.workspace = true
+champagne-macros.workspace = true
+pin-project.workspace = true
+dynasm.workspace = true
+champagne-loader.workspace = true
+champagne-kernel.workspace = true
+champagne-winapi = { version = "0.1.0", path = "../champagne-winapi" }
