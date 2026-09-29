@@ -28,6 +28,7 @@ pub mod event;
 pub mod heap;
 pub mod ldr;
 pub mod misc;
+pub mod net;
 pub mod object;
 pub mod peb;
 pub mod perf;
