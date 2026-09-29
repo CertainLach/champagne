@@ -20,8 +20,10 @@ pub fn to_wide(s: &str) -> Vec<u16> {
 }
 
 pub mod app;
+pub mod certstore;
 pub mod critical_section;
 pub mod crt;
+pub mod crypto;
 pub mod event;
 pub mod heap;
 pub mod ldr;
