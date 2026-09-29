@@ -27,6 +27,7 @@ pub mod crypto;
 pub mod event;
 pub mod heap;
 pub mod ldr;
+pub mod memory;
 pub mod misc;
 pub mod net;
 pub mod object;
