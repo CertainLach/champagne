@@ -1,7 +1,5 @@
 use std::env;
 use std::ffi::{CStr, c_void};
-use std::iter::once;
-use std::mem::offset_of;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
@@ -10,6 +8,7 @@ use tracing::debug;
 use widestring::U16CStr;
 
 use crate::peb::{ERROR_ENVVAR_NOT_FOUND, SetLastError};
+use crate::to_wide;
 
 #[repr(C)]
 struct StartupInfoW {
@@ -32,8 +31,8 @@ struct StartupInfoW {
 	h_std_output: *mut c_void,
 	h_std_error: *mut c_void,
 }
-const _: () = assert!(size_of::<StartupInfoW>() == 104);
-const _: () = assert!(offset_of!(StartupInfoW, h_std_input) == 80);
+assert_size!(StartupInfoW, 104);
+assert_offset!(StartupInfoW, h_std_input, 80);
 
 fn emit_env<T: Copy + Default>(value: &[T], buf: *mut T, size: u32) -> u32 {
 	if buf.is_null() || value.len() + 1 > size as usize {
@@ -47,9 +46,7 @@ fn emit_env<T: Copy + Default>(value: &[T], buf: *mut T, size: u32) -> u32 {
 }
 
 fn wide(cell: &'static OnceLock<Vec<u16>>, s: &str) -> *mut u16 {
-	cell.get_or_init(|| s.encode_utf16().chain(once(0)).collect())
-		.as_ptr()
-		.cast_mut()
+	cell.get_or_init(|| to_wide(s)).as_ptr().cast_mut()
 }
 
 #[winfn]

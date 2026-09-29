@@ -1,5 +1,24 @@
 extern crate self as champagne_winapi;
 
+macro_rules! assert_size {
+	($ty:ty, $size:expr) => {
+		const _: () = assert!(std::mem::size_of::<$ty>() == $size);
+	};
+}
+
+macro_rules! assert_offset {
+	($ty:ty, $field:ident, $offset:expr) => {
+		const _: () = assert!(std::mem::offset_of!($ty, $field) == $offset);
+	};
+}
+
+pub(crate) use assert_offset;
+pub(crate) use assert_size;
+
+pub fn to_wide(s: &str) -> Vec<u16> {
+	s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 pub mod app;
 pub mod critical_section;
 pub mod crt;
@@ -19,10 +38,12 @@ pub mod thread;
 pub mod time;
 pub mod tls;
 
-mod heap_raw;
+pub(crate) mod heap_raw;
 
 #[doc(hidden)]
 pub use inventory;
+#[doc(hidden)]
+pub use tracing::instrument;
 
 pub struct WinFn {
 	pub name: &'static str,

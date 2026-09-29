@@ -1,13 +1,9 @@
-use std::alloc::{Layout, alloc_zeroed};
-use std::arch::asm;
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
-use std::marker::PhantomData;
-use std::mem::offset_of;
-use std::ptr::{null, write_volatile};
+use std::ptr::write_volatile;
 
 use crate::ldr::TlsTemplate;
-use crate::peb::{Peb, PebHandle, PebLike as _, PebRef, VirtualPeb};
+use crate::peb::{Peb, PebHandle, PebRef};
 
 pub const TLS_MINIMUM_AVAILABLE: usize = 64;
 pub const TLS_OUT_OF_INDEXES: u32 = 0xFFFFFFFF;
@@ -32,48 +28,9 @@ struct TibNtrnl {
 	reserved: [u8; 0x1480 - 0x70],
 	tls_slots: [*mut c_void; TLS_MINIMUM_AVAILABLE],
 }
-const _: () = assert!(offset_of!(TibNtrnl, this) == 0x30);
-const _: () = assert!(offset_of!(TibNtrnl, peb) == 0x60);
-const _: () = assert!(offset_of!(TibNtrnl, tls_slots) == 0x1480);
-
-pub struct VirtualTib<'peb>(
-	Box<UnsafeCell<TibNtrnl>>,
-	PhantomData<(&'peb VirtualPeb, *const ())>,
-);
-impl VirtualTib<'_> {
-	pub fn new(peb: &VirtualPeb) -> Self {
-		let handle = PebHandle(peb.as_ptr());
-		let tid = handle.to_ref().private().alloc_thread_id();
-		Self::for_peb(handle, tid)
-	}
-	pub fn for_peb(peb: PebHandle, tid: u32) -> Self {
-		let mut boxed: Box<UnsafeCell<TibNtrnl>> = unsafe {
-			let layout = Layout::new::<UnsafeCell<TibNtrnl>>();
-			Box::from_raw(alloc_zeroed(layout).cast())
-		};
-		boxed.get_mut().this = boxed.get();
-		boxed.get_mut().tls = null();
-		boxed.get_mut().peb = peb.0;
-		boxed.get_mut().pid = std::process::id() as usize as *const ();
-		boxed.get_mut().tid = tid as usize as *const ();
-		Self(boxed, PhantomData)
-	}
-	/// SAFETY: Until returned EnteredVirtualTib is dropped, nothing should want data from original tib,
-	/// or perform unbalanced (Ie setting, but not restoring) gs segment register access.
-	pub fn enter(&self) -> EnteredVirtualTib {
-		let prevbase: *const ();
-		let gs: *const TibNtrnl = self.0.get();
-		unsafe {
-			asm!(
-				"rdgsbase {prevbase}",
-				"wrgsbase {gs}",
-				prevbase = out(reg) prevbase,
-				gs = in(reg) gs,
-			);
-		};
-		EnteredVirtualTib { prevbase }
-	}
-}
+assert_offset!(TibNtrnl, this, 0x30);
+assert_offset!(TibNtrnl, peb, 0x60);
+assert_offset!(TibNtrnl, tls_slots, 0x1480);
 
 pub struct TibRef(&'static UnsafeCell<TibNtrnl>);
 impl TibRef {
@@ -129,18 +86,6 @@ impl TibRef {
 	}
 }
 
-#[cfg(not(windows))]
-#[must_use]
-pub struct EnteredVirtualTib {
-	prevbase: *const (),
-}
-#[cfg(not(windows))]
-impl Drop for EnteredVirtualTib {
-	fn drop(&mut self) {
-		unsafe { asm!("wrgsbase {gs}", gs = in(reg) self.prevbase) }
-	}
-}
-
 pub fn get_tib() -> TibRef {
 	let tib: *const UnsafeCell<TibNtrnl>;
 	#[cfg(windows)]
@@ -155,4 +100,68 @@ pub fn get_tib() -> TibRef {
 	};
 	assert!(!tib.is_null(), "missing tib");
 	TibRef(unsafe { &*tib })
+}
+
+#[cfg(not(windows))]
+pub mod unix {
+	use std::alloc::{Layout, alloc_zeroed};
+	use std::arch::asm;
+	use std::cell::UnsafeCell;
+	use std::marker::PhantomData;
+	use std::process;
+	use std::ptr::null;
+
+	use crate::peb::PebHandle;
+	use crate::peb::unix::{PebLikeUnixExt as _, VirtualPeb};
+
+	use super::TibNtrnl;
+
+	/// TIB emulation, only used on non-windows, in windows real PEB should be used.
+	pub struct VirtualTib<'peb>(
+		Box<UnsafeCell<TibNtrnl>>,
+		PhantomData<(&'peb VirtualPeb, *const ())>,
+	);
+	impl VirtualTib<'_> {
+		pub fn new(peb: &VirtualPeb) -> Self {
+			let handle = PebHandle(peb.as_ptr());
+			let tid = handle.to_ref().private().alloc_thread_id();
+			Self::for_peb(handle, tid)
+		}
+		pub fn for_peb(peb: PebHandle, tid: u32) -> Self {
+			let mut boxed: Box<UnsafeCell<TibNtrnl>> = unsafe {
+				let layout = Layout::new::<UnsafeCell<TibNtrnl>>();
+				Box::from_raw(alloc_zeroed(layout).cast())
+			};
+			boxed.get_mut().this = boxed.get();
+			boxed.get_mut().tls = null();
+			boxed.get_mut().peb = peb.0;
+			boxed.get_mut().pid = process::id() as usize as *const ();
+			boxed.get_mut().tid = tid as usize as *const ();
+			Self(boxed, PhantomData)
+		}
+		/// SAFETY: Until returned EnteredVirtualTib is dropped, nothing should want data from original tib,
+		/// or perform unbalanced (Ie setting, but not restoring) gs segment register access.
+		pub fn enter(&self) -> EnteredVirtualTib {
+			let prevbase: *const ();
+			let gs: *const TibNtrnl = self.0.get();
+			unsafe {
+				asm!(
+					"rdgsbase {prevbase}",
+					"wrgsbase {gs}",
+					prevbase = out(reg) prevbase,
+					gs = in(reg) gs,
+				);
+			};
+			EnteredVirtualTib { prevbase }
+		}
+	}
+	#[must_use]
+	pub struct EnteredVirtualTib {
+		prevbase: *const (),
+	}
+	impl Drop for EnteredVirtualTib {
+		fn drop(&mut self) {
+			unsafe { asm!("wrgsbase {gs}", gs = in(reg) self.prevbase) }
+		}
+	}
 }

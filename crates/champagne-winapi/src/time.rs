@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use champagne_macros::winfn;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
+use crate::assert_size;
 use crate::peb::{ERROR_INVALID_PARAMETER, SetLastError};
 
 const TIME_ZONE_ID_UNKNOWN: u32 = 0;
@@ -20,7 +21,7 @@ struct SystemTimeW {
 	second: u16,
 	milliseconds: u16,
 }
-const _: () = assert!(size_of::<SystemTimeW>() == 16);
+assert_size!(SystemTimeW, 16);
 
 #[repr(C)]
 struct TimeZoneInformation {
@@ -32,7 +33,7 @@ struct TimeZoneInformation {
 	daylight_date: SystemTimeW,
 	daylight_bias: i32,
 }
-const _: () = assert!(size_of::<TimeZoneInformation>() == 172);
+assert_size!(TimeZoneInformation, 172);
 
 fn system_time_from_unix(secs: i64, milliseconds: u16) -> SystemTimeW {
 	let at = OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH);
@@ -70,8 +71,7 @@ fn now_unix() -> (i64, u16) {
 	(now.as_secs() as i64, now.subsec_millis() as u16)
 }
 
-#[winfn]
-#[alias(GetSystemTime)]
+#[winfn(alias(GetSystemTime))]
 fn GetLocalTime(out: *mut SystemTimeW) {
 	if out.is_null() {
 		return;
@@ -118,8 +118,7 @@ fn FileTimeToSystemTime(file_time: *const u64, out: *mut SystemTimeW) -> i32 {
 	1
 }
 
-#[winfn]
-#[alias(TzSpecificLocalTimeToSystemTime)]
+#[winfn(alias(TzSpecificLocalTimeToSystemTime))]
 fn SystemTimeToTzSpecificLocalTime(
 	_zone: *const TimeZoneInformation,
 	input: *const SystemTimeW,
@@ -133,7 +132,7 @@ fn SystemTimeToTzSpecificLocalTime(
 	1
 }
 
-#[winfn]
+#[winfn(alias(GetSystemTimePreciseAsFileTime))]
 fn GetSystemTimeAsFileTime(out: *mut u64) {
 	if out.is_null() {
 		return;

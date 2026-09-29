@@ -1,3 +1,5 @@
+use std::mem::transmute;
+
 pub trait KnownCcFunction {
 	unsafe fn from_ptr(ptr: *const ()) -> Self;
 }
@@ -20,7 +22,7 @@ macro_rules! impl_args_like {
 		}
 		impl<T, $($gen,)*> KnownCcFunction for unsafe extern "win64" fn($($gen,)*) -> T {
 			unsafe fn from_ptr(ptr: *const ()) -> Self {
-				unsafe{std::mem::transmute(ptr)}
+				unsafe{transmute(ptr)}
 			}
 		}
 		// Assuming linux here

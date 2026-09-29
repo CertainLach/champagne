@@ -9,18 +9,21 @@ use crate::peb::{ERROR_NO_MORE_ITEMS, SetLastError};
 const HEAP_ZERO_MEMORY: u32 = 0x8;
 const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
 
-#[winfn]
+// Too much noise, can ba analyzed by normal heap profilers
+#[winfn(no_instrument)]
 fn HeapAlloc(_heap: *mut c_void, flags: u32, size: usize) -> *mut c_void {
 	unsafe { heap_alloc(size, flags & HEAP_ZERO_MEMORY != 0) }
 }
 
-#[winfn]
+// Too much noise, can ba analyzed by normal heap profilers
+#[winfn(no_instrument)]
 fn HeapFree(_heap: *mut c_void, _flags: u32, mem: *mut c_void) -> i32 {
 	unsafe { heap_free(mem) };
 	1
 }
 
-#[winfn]
+// Too much noise, can ba analyzed by normal heap profilers
+#[winfn(no_instrument)]
 fn HeapReAlloc(_heap: *mut c_void, flags: u32, mem: *mut c_void, size: usize) -> *mut c_void {
 	if flags & HEAP_REALLOC_IN_PLACE_ONLY != 0 {
 		return null_mut();

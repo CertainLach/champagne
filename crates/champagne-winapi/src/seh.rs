@@ -1,14 +1,17 @@
 use std::arch::naked_asm;
 use std::ffi::c_void;
-use std::mem::offset_of;
-use std::ptr::null;
+use std::mem::{self, offset_of};
+use std::process::abort;
+use std::ptr::{self, null, null_mut};
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use champagne_kernel::peb::PebLike as _;
 use champagne_kernel::tib::get_tib;
 use champagne_macros::winfn;
-use tracing::warn;
+use tracing::{trace, warn};
+
+use crate::{assert_offset, assert_size};
 
 const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 
@@ -30,6 +33,7 @@ const UWOP_SAVE_XMM128: u8 = 8;
 const UWOP_SAVE_XMM128_FAR: u8 = 9;
 const UWOP_PUSH_MACHFRAME: u8 = 10;
 
+#[derive(Clone, Copy)]
 #[repr(C, align(16))]
 pub struct Context {
 	pub p1_home: u64,
@@ -79,13 +83,13 @@ pub struct Context {
 	pub last_exception_to_rip: u64,
 	pub last_exception_from_rip: u64,
 }
-const _: () = assert!(size_of::<Context>() == 0x4D0);
-const _: () = assert!(offset_of!(Context, context_flags) == 0x30);
-const _: () = assert!(offset_of!(Context, rax) == 0x78);
-const _: () = assert!(offset_of!(Context, rsp) == 0x98);
-const _: () = assert!(offset_of!(Context, rip) == 0xF8);
-const _: () = assert!(offset_of!(Context, flt_save) == 0x100);
-const _: () = assert!(offset_of!(Context, vector_register) == 0x300);
+assert_size!(Context, 0x4D0);
+assert_offset!(Context, context_flags, 0x30);
+assert_offset!(Context, rax, 0x78);
+assert_offset!(Context, rsp, 0x98);
+assert_offset!(Context, rip, 0xF8);
+assert_offset!(Context, flt_save, 0x100);
+assert_offset!(Context, vector_register, 0x300);
 
 impl Context {
 	fn int_reg(&mut self, index: u8) -> &mut u64 {
@@ -120,13 +124,35 @@ pub struct ExceptionRecord {
 	pub reserved: u32,
 	pub exception_information: [usize; 15],
 }
-const _: () = assert!(size_of::<ExceptionRecord>() == 152);
+assert_size!(ExceptionRecord, 152);
 
 #[repr(C)]
 pub struct ExceptionPointers {
 	pub exception_record: *mut ExceptionRecord,
 	pub context_record: *mut Context,
 }
+
+#[repr(C)]
+pub struct DispatcherContext {
+	pub control_pc: u64,
+	pub image_base: u64,
+	pub function_entry: *const RuntimeFunction,
+	pub establisher_frame: u64,
+	pub target_ip: u64,
+	pub context_record: *mut Context,
+	pub language_handler: *const c_void,
+	pub handler_data: *mut c_void,
+	pub history_table: *mut c_void,
+	pub scope_index: u32,
+	pub fill0: u32,
+}
+
+type ExceptionHandlerFn = unsafe extern "win64" fn(
+	*mut ExceptionRecord,
+	u64,
+	*mut Context,
+	*mut DispatcherContext,
+) -> i32;
 
 fn exception_name(code: u32) -> &'static str {
 	match code {
@@ -281,7 +307,7 @@ fn RtlPcToFileHeader(pc: *mut c_void, base_of_image: *mut *mut c_void) -> *mut c
 	let found = peb
 		.find_entry_by_pc(pc as usize)
 		.map(|e| e.base().cast_mut().cast::<c_void>())
-		.unwrap_or(std::ptr::null_mut());
+		.unwrap_or(null_mut());
 	if !base_of_image.is_null() {
 		unsafe { base_of_image.write(found) };
 	}
@@ -523,7 +549,7 @@ fn UnhandledExceptionFilter(info: *mut ExceptionPointers) -> i32 {
 		}
 	}
 	if !info.context_record.is_null() {
-		walk(unsafe { std::ptr::read(info.context_record) }, 24);
+		walk(unsafe { ptr::read(info.context_record) }, 24, false);
 	}
 	1
 }
@@ -532,15 +558,144 @@ fn SetUnhandledExceptionFilter(filter: *mut c_void) -> *mut c_void {
 	static FILTER: AtomicUsize = AtomicUsize::new(0);
 	FILTER.swap(filter as usize, Ordering::Relaxed) as *mut c_void
 }
-#[winfn]
-fn RaiseException(code: u32, flags: u32, _n_args: u32, _args: *const usize) {
-	panic!("todo: seh: exception {code:#x} raised with flags {flags:#x}");
+unsafe extern "win64" fn dispatch_exception_impl(
+	code: u32,
+	flags: u32,
+	n_args: u32,
+	args: *const usize,
+	context: *mut Context,
+) -> i32 {
+	trace!(
+		"RaiseException: code={code:#x} ({}) flags={flags:#x}",
+		exception_name(code)
+	);
+	if !context.is_null() {
+		walk(unsafe { *context }, 12, true);
+	}
+
+	let mut record = unsafe { mem::zeroed::<ExceptionRecord>() };
+	record.exception_code = code;
+	record.exception_flags = flags;
+	record.number_parameters = n_args.min(15);
+	if !args.is_null() && n_args > 0 {
+		for i in 0..record.number_parameters as usize {
+			record.exception_information[i] = unsafe { args.add(i).read() };
+		}
+	}
+	record.exception_address = unsafe { (*context).rip } as *mut c_void;
+
+	let mut walk = unsafe { *context };
+
+	for _ in 0..64 {
+		let Some((image_base, func)) = lookup(walk.rip as usize) else {
+			break;
+		};
+
+		let saved_rip = walk.rip;
+		let mut handler_data: *mut c_void = null_mut();
+		let mut establisher_frame: u64 = 0;
+
+		let handler = unsafe {
+			virtual_unwind(
+				1,
+				image_base as u64,
+				saved_rip,
+				func,
+				&mut walk,
+				&mut handler_data,
+				&mut establisher_frame,
+			)
+		};
+
+		if !handler.is_null() {
+			let mut dispatcher = DispatcherContext {
+				control_pc: saved_rip,
+				image_base: image_base as u64,
+				function_entry: func,
+				establisher_frame,
+				target_ip: 0,
+				context_record: context,
+				language_handler: handler,
+				handler_data,
+				history_table: null_mut(),
+				scope_index: 0,
+				fill0: 0,
+			};
+
+			let handler_fn: ExceptionHandlerFn = unsafe { mem::transmute(handler) };
+			let disposition =
+				unsafe { handler_fn(&mut record, establisher_frame, context, &mut dispatcher) };
+
+			match disposition {
+				0 => return 1,
+				1 => {}
+				_ => {
+					warn!("unexpected exception disposition {disposition}");
+					break;
+				}
+			}
+		}
+
+		if walk.rip == 0 {
+			break;
+		}
+	}
+
+	warn!("no exception handler found for {code:#x}");
+	backtrace(12, false);
+	0
 }
 
-pub fn backtrace(limit: usize) {
-	let mut context = unsafe { std::mem::zeroed::<Context>() };
+#[winfn]
+#[unsafe(naked)]
+unsafe fn RaiseException(_code: u32, _flags: u32, _n_args: u32, _args: *const usize) {
+	naked_asm!(
+		"mov [rsp + 8], rcx",
+		"mov [rsp + 16], rdx",
+		"mov [rsp + 24], r8",
+		"mov [rsp + 32], r9",
+		"push rbp",
+		"mov rbp, rsp",
+		"sub rsp, 0x500",
+		"lea rcx, [rsp + 0x30]",
+		"call {capture}",
+		"lea rcx, [rsp + 0x30]",
+		"mov rax, [rbp + 8]",
+		"mov [rcx + {rip}], rax",
+		"lea rax, [rbp + 16]",
+		"mov [rcx + {rsp}], rax",
+		"mov rax, [rbp]",
+		"mov [rcx + {rbp}], rax",
+		"mov ecx, [rbp + 16]",
+		"mov edx, [rbp + 24]",
+		"mov r8d, [rbp + 32]",
+		"mov r9, [rbp + 40]",
+		"lea rax, [rsp + 0x30]",
+		"mov [rsp + 0x20], rax",
+		"call {dispatch}",
+		"test eax, eax",
+		"jnz 2f",
+		"mov edx, [rbp + 24]",
+		"test edx, 1",
+		"jnz 3f",
+		"2:",
+		"add rsp, 0x500",
+		"pop rbp",
+		"ret",
+		"3:",
+		"ud2",
+		capture = sym RtlCaptureContext,
+		dispatch = sym dispatch_exception_impl,
+		rip = const offset_of!(Context, rip),
+		rsp = const offset_of!(Context, rsp),
+		rbp = const offset_of!(Context, rbp),
+	)
+}
+
+pub fn backtrace(limit: usize, trace: bool) {
+	let mut context = unsafe { mem::zeroed::<Context>() };
 	unsafe { RtlCaptureContext(&mut context) };
-	walk(context, limit)
+	walk(context, limit, trace)
 }
 
 fn describe(pc: usize) -> String {
@@ -551,16 +706,27 @@ fn describe(pc: usize) -> String {
 	}
 }
 
-fn walk(mut context: Context, limit: usize) {
+fn walk(mut context: Context, limit: usize, trace: bool) {
 	for depth in 0..limit {
 		let Some((image_base, function)) = lookup(context.rip as usize) else {
-			warn!(
-				"  frame {depth}: {} (no unwind info)",
-				describe(context.rip as usize)
-			);
+			if trace {
+				trace!(
+					"  frame {depth}: {} (no unwind info)",
+					describe(context.rip as usize)
+				);
+			} else {
+				warn!(
+					"  frame {depth}: {} (no unwind info)",
+					describe(context.rip as usize)
+				);
+			}
 			break;
 		};
-		warn!("  frame {depth}: {}", describe(context.rip as usize));
+		if trace {
+			trace!("  frame {depth}: {}", describe(context.rip as usize));
+		} else {
+			warn!("  frame {depth}: {}", describe(context.rip as usize));
+		}
 		let mut frame = 0u64;
 		unsafe {
 			virtual_unwind(
@@ -569,7 +735,7 @@ fn walk(mut context: Context, limit: usize) {
 				context.rip,
 				function,
 				&mut context,
-				std::ptr::null_mut(),
+				null_mut(),
 				&mut frame,
 			)
 		};
@@ -578,3 +744,142 @@ fn walk(mut context: Context, limit: usize) {
 		}
 	}
 }
+
+#[winfn]
+#[unsafe(naked)]
+unsafe fn RtlRestoreContext(_context: *mut Context, _exception_record: *mut ExceptionRecord) {
+	naked_asm!(
+		"mov rdx, [rcx + {rdx}]",
+		"mov rbx, [rcx + {rbx}]",
+		"mov rbp, [rcx + {rbp}]",
+		"mov rsi, [rcx + {rsi}]",
+		"mov rdi, [rcx + {rdi}]",
+		"mov r8, [rcx + {r8}]",
+		"mov r9, [rcx + {r9}]",
+		"mov r10, [rcx + {r10}]",
+		"mov r11, [rcx + {r11}]",
+		"mov r12, [rcx + {r12}]",
+		"mov r13, [rcx + {r13}]",
+		"mov r14, [rcx + {r14}]",
+		"mov r15, [rcx + {r15}]",
+		"movups xmm6, [rcx + {xmm} + 0x60]",
+		"movups xmm7, [rcx + {xmm} + 0x70]",
+		"movups xmm8, [rcx + {xmm} + 0x80]",
+		"movups xmm9, [rcx + {xmm} + 0x90]",
+		"movups xmm10, [rcx + {xmm} + 0xA0]",
+		"movups xmm11, [rcx + {xmm} + 0xB0]",
+		"movups xmm12, [rcx + {xmm} + 0xC0]",
+		"movups xmm13, [rcx + {xmm} + 0xD0]",
+		"movups xmm14, [rcx + {xmm} + 0xE0]",
+		"movups xmm15, [rcx + {xmm} + 0xF0]",
+		"mov rsp, [rcx + {rsp}]",
+		"mov rax, [rcx + {rip}]",
+		"push rax",
+		"mov rax, [rcx + {rax}]",
+		"mov rcx, [rcx + {rcx}]",
+		"ret",
+		rax = const offset_of!(Context, rax),
+		rcx = const offset_of!(Context, rcx),
+		rdx = const offset_of!(Context, rdx),
+		rbx = const offset_of!(Context, rbx),
+		rsp = const offset_of!(Context, rsp),
+		rbp = const offset_of!(Context, rbp),
+		rsi = const offset_of!(Context, rsi),
+		rdi = const offset_of!(Context, rdi),
+		r8 = const offset_of!(Context, r8),
+		r9 = const offset_of!(Context, r9),
+		r10 = const offset_of!(Context, r10),
+		r11 = const offset_of!(Context, r11),
+		r12 = const offset_of!(Context, r12),
+		r13 = const offset_of!(Context, r13),
+		r14 = const offset_of!(Context, r14),
+		r15 = const offset_of!(Context, r15),
+		rip = const offset_of!(Context, rip),
+		xmm = const offset_of!(Context, flt_save) + XMM_SAVE_OFFSET,
+	)
+}
+
+// Restores context, instrumentation will be broken
+#[winfn(no_instrument)]
+fn RtlUnwindEx(
+	target_frame: *mut c_void,
+	target_ip: *mut c_void,
+	_exception_record: *mut ExceptionRecord,
+	return_value: *mut c_void,
+	original_context: *mut Context,
+	_history_table: *mut c_void,
+) {
+	if original_context.is_null() {
+		warn!("null context");
+		abort();
+	}
+
+	let target_frame_addr = target_frame as u64;
+	let mut context = unsafe { *original_context };
+
+	for _ in 0..256 {
+		let saved = context;
+
+		let Some((image_base, func)) = lookup(context.rip as usize) else {
+			break;
+		};
+
+		let mut handler_data: *mut c_void = null_mut();
+		let mut establisher_frame: u64 = 0;
+
+		unsafe {
+			virtual_unwind(
+				2,
+				image_base as u64,
+				context.rip,
+				func,
+				&mut context,
+				&mut handler_data,
+				&mut establisher_frame,
+			);
+		}
+
+		if establisher_frame == target_frame_addr {
+			let mut target_ctx = saved;
+			target_ctx.rip = target_ip as u64;
+			target_ctx.rax = return_value as u64;
+			unsafe { RtlRestoreContext(&mut target_ctx, null_mut()) };
+			unreachable!();
+		}
+
+		if context.rip == 0 {
+			break;
+		}
+	}
+
+	warn!("target frame {target_frame_addr:#x} not found");
+	abort();
+}
+
+#[winfn]
+fn RtlAddFunctionTable(_table: *const c_void, _count: u32, _base: u64) -> i32 {
+	1
+}
+
+#[winfn]
+fn RtlDeleteFunctionTable(_table: *const c_void) -> i32 {
+	1
+}
+
+#[winfn]
+fn RtlAddGrowableFunctionTable(
+	table: *mut *mut c_void,
+	_entries: *const c_void,
+	_count: u32,
+	_max: u32,
+	_base: u64,
+	_end: u64,
+) -> u32 {
+	if !table.is_null() {
+		unsafe { table.write(0xF001usize as *mut c_void) };
+	}
+	0
+}
+
+#[winfn]
+fn RtlDeleteGrowableFunctionTable(_table: *mut c_void) {}

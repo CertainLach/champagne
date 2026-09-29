@@ -1,58 +1,47 @@
 use std::ffi::c_void;
-#[cfg(not(target_os = "windows"))]
-use std::mem::forget;
 use std::ptr::null_mut;
-
-#[cfg(not(target_os = "windows"))]
-use parking_lot::ReentrantMutex;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
+	fn InitializeCriticalSectionAndSpinCount(cs: *mut c_void, _spin: u32) -> i32;
 	fn EnterCriticalSection(lock: *mut c_void);
 	fn LeaveCriticalSection(lock: *mut c_void);
+	fn DeleteCriticalSection(cs: *mut c_void);
 }
-
-#[cfg(not(target_os = "windows"))]
-#[repr(C)]
-pub struct CriticalSection(Option<Box<ReentrantMutex<()>>>);
-#[cfg(not(target_os = "windows"))]
-impl CriticalSection {
-	pub fn null() -> Self {
-		Self(None)
-	}
-	pub fn new() -> Self {
-		Self(Some(Box::new(ReentrantMutex::new(()))))
-	}
-	pub fn init(&mut self) {
-		self.0 = Some(Box::new(ReentrantMutex::new(())));
-	}
-	pub fn is_initialized(&self) -> bool {
-		self.0.is_some()
-	}
-	pub fn enter(&self) {
-		forget(self.0.as_ref().expect("initialized").lock())
-	}
-	/// SAFETY: CS should be entered
-	pub unsafe fn leave(&self) {
-		unsafe { self.0.as_ref().expect("initialized").force_unlock() }
-	}
-}
-#[cfg(not(target_os = "windows"))]
-const _: () = assert!(size_of::<CriticalSection>() == size_of::<usize>());
 
 #[repr(transparent)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct CriticalSectionPtr(*mut c_void);
 
 impl CriticalSectionPtr {
 	pub fn null() -> Self {
 		Self(null_mut())
 	}
-	#[cfg(not(windows))]
-	pub fn owned() -> Self {
-		let lock = Box::into_raw(Box::new(CriticalSection::new()));
-		Self(lock.cast())
+	pub fn init(&mut self, _spin: u32) {
+		#[cfg(windows)]
+		unsafe {
+			InitializeCriticalSectionAndSpinCount(self.0, _spin)
+		};
+		#[cfg(not(windows))]
+		unsafe {
+			(self.0.cast::<unix::VirtualCriticalSection>())
+				.write(unix::VirtualCriticalSection::new())
+		};
+	}
+	/// # Safety
+	///
+	/// Should be initialized
+	pub unsafe fn delete(&mut self) {
+		#[cfg(windows)]
+		unsafe {
+			DeleteCriticalSection(self.0)
+		};
+		#[cfg(not(windows))]
+		unsafe {
+			(self.0.cast::<unix::VirtualCriticalSection>())
+				.write(unix::VirtualCriticalSection::null())
+		};
 	}
 	pub fn enter(self) {
 		assert!(!self.0.is_null(), "critical section is missing");
@@ -62,9 +51,12 @@ impl CriticalSectionPtr {
 		};
 		#[cfg(not(windows))]
 		unsafe {
-			(*self.0.cast::<CriticalSection>()).enter()
+			(*self.0.cast::<unix::VirtualCriticalSection>()).enter()
 		};
 	}
+	/// # Safety
+	///
+	/// Should be balanced with self.enter()
 	pub unsafe fn leave(self) {
 		#[cfg(windows)]
 		unsafe {
@@ -72,15 +64,15 @@ impl CriticalSectionPtr {
 		};
 		#[cfg(not(windows))]
 		unsafe {
-			(*self.0.cast::<CriticalSection>()).leave()
+			(*self.0.cast::<unix::VirtualCriticalSection>()).leave()
 		};
 	}
 	pub fn guard(self) -> CriticalSectionGuard {
 		self.enter();
 		CriticalSectionGuard(self)
 	}
-	pub unsafe fn from_raw(cs: *mut c_void) -> Self {
-		Self(cs)
+	pub fn is_null(&self) -> bool {
+		self.0.is_null()
 	}
 }
 
@@ -89,5 +81,54 @@ pub struct CriticalSectionGuard(CriticalSectionPtr);
 impl Drop for CriticalSectionGuard {
 	fn drop(&mut self) {
 		unsafe { self.0.leave() }
+	}
+}
+
+#[cfg(not(windows))]
+pub mod unix {
+	use parking_lot::ReentrantMutex;
+	use std::mem::forget;
+
+	use super::CriticalSectionPtr;
+	/// CriticalSection emulation, only used on non-windows, in windows real CriticalSection should be used.
+	#[repr(C)]
+	pub struct VirtualCriticalSection(Option<Box<ReentrantMutex<()>>>);
+	impl VirtualCriticalSection {
+		pub fn null() -> Self {
+			Self(None)
+		}
+		pub fn new() -> Self {
+			Self(Some(Box::new(ReentrantMutex::new(()))))
+		}
+		pub fn init(&mut self) {
+			self.0 = Some(Box::new(ReentrantMutex::new(())));
+		}
+		pub fn is_initialized(&self) -> bool {
+			self.0.is_some()
+		}
+		pub fn enter(&self) {
+			forget(self.0.as_ref().expect("initialized").lock())
+		}
+		/// # Safety
+		///
+		/// CS should be entered
+		pub unsafe fn leave(&self) {
+			unsafe { self.0.as_ref().expect("initialized").force_unlock() }
+		}
+	}
+	impl Default for VirtualCriticalSection {
+		fn default() -> Self {
+			Self::new()
+		}
+	}
+
+	assert_size!(VirtualCriticalSection, size_of::<usize>());
+
+	impl CriticalSectionPtr {
+		#[cfg(not(windows))]
+		pub fn unix() -> Self {
+			let lock = Box::into_raw(Box::new(VirtualCriticalSection::new()));
+			Self(lock.cast())
+		}
 	}
 }

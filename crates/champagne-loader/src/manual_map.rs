@@ -4,13 +4,11 @@ use std::fs::File;
 use std::mem::{ManuallyDrop, transmute};
 use std::path::Path;
 use std::ptr::{addr_of, null};
-#[cfg(not(windows))]
-use std::sync::atomic::AtomicU64;
+
+use std::process;
 
 use champagne_kernel::ldr::OwnedLdrData;
 use champagne_kernel::peb::{PebLike, get_peb};
-#[cfg(not(windows))]
-use memmap2::MmapMut;
 use memmap2::{Mmap, MmapOptions};
 use nt_string::unicode_string::NtUnicodeString;
 use pelite::image::{
@@ -21,7 +19,13 @@ use pelite::pe64::{GetProcAddress as _, Pe as _, PeFile};
 use pelite::util::AlignTo as _;
 use pelite::{Export, Import};
 use region::Protection;
+use std::sync::atomic::Ordering;
 use tracing::{debug, info, trace, warn};
+
+#[cfg(not(windows))]
+use memmap2::MmapMut;
+#[cfg(not(windows))]
+use std::sync::atomic::AtomicU64;
 
 use crate::cc::KnownCcFunction;
 use crate::entry::DLL_PROCESS_ATTACH;
@@ -47,8 +51,8 @@ fn map_image(len: usize) -> Result<MmapMut> {
 	static SHM_CTR: AtomicU64 = AtomicU64::new(0);
 	let shm_name = format!(
 		"/dllloader-{}-{}",
-		std::process::id(),
-		SHM_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+		process::id(),
+		SHM_CTR.fetch_add(1, Ordering::Relaxed)
 	);
 	let map = shm_open(
 		shm_name.as_str(),
@@ -296,9 +300,7 @@ impl PeImage {
 		})
 	}
 	fn pe(&self) -> PeFile<'_> {
-		let file = PeFile::from_bytes(&self.ro_orig_image)
-			.expect("file shouldn't be corrupted during linking");
-		file
+		PeFile::from_bytes(&self.ro_orig_image).expect("file shouldn't be corrupted during linking")
 	}
 	fn mirror<T>(&self, v: &T) -> &T {
 		mirror_raw(&self.image, &self.ro_orig_image, &self.pe(), v)
@@ -358,7 +360,11 @@ impl FinishedPeImage {
 	/// # Safety
 	///
 	/// This function executes code from the loaded library
+	// TODO: windows
+	#[cfg(not(windows))]
 	pub unsafe fn init_static_tls(&self) -> Result<()> {
+		use champagne_kernel::peb::unix::PebLikeUnixExt as _;
+
 		let tls = self.pe().tls();
 		if tls.err() == Some(pelite::Error::Null) {
 			debug!("image has no tls");

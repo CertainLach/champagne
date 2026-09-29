@@ -4,12 +4,16 @@ use std::slice;
 
 use champagne_macros::winfn;
 use tracing::info;
+use widestring::U16CStr;
+
+use crate::peb::{ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, SetLastError};
 
 const CSTR_LESS_THAN: i32 = 1;
 const CSTR_EQUAL: i32 = 2;
 const CSTR_GREATER_THAN: i32 = 3;
 
-use crate::peb::{ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, SetLastError};
+const LCID_EN_US: u32 = 0x0409;
+const LOCALE_USER_DEFAULT: u32 = 0x0400;
 
 fn mb_input<'a>(src: *const u8, len: i32) -> &'a [u8] {
 	unsafe {
@@ -22,9 +26,12 @@ fn mb_input<'a>(src: *const u8, len: i32) -> &'a [u8] {
 }
 
 fn wc_input<'a>(src: *const u16, len: i32) -> &'a [u16] {
+	if src.is_null() || (src as usize) & 1 != 0 {
+		return &[];
+	}
 	unsafe {
 		if len < 0 {
-			widestring::U16CStr::from_ptr_str(src).as_slice_with_nul()
+			U16CStr::from_ptr_str(src).as_slice_with_nul()
 		} else {
 			slice::from_raw_parts(src, len as usize)
 		}
@@ -63,12 +70,11 @@ fn OutputDebugStringW(s: *const u16) {
 	if s.is_null() {
 		return;
 	}
-	let s = unsafe { widestring::U16CStr::from_ptr_str(s) };
+	let s = unsafe { U16CStr::from_ptr_str(s) };
 	info!("image debug output: {}", s.to_string_lossy());
 }
 
-#[winfn]
-#[alias(GetOEMCP)]
+#[winfn(alias(GetOEMCP))]
 fn GetACP() -> u32 {
 	CP_UTF8
 }
@@ -146,7 +152,30 @@ const C1_XDIGIT: u16 = 0x80;
 const C1_ALPHA: u16 = 0x100;
 const C1_DEFINED: u16 = 0x200;
 
-#[winfn]
+#[winfn(alias(GetStringTypeExA))]
+fn GetStringTypeA(
+	_locale: u32,
+	info_type: u32,
+	src: *const u8,
+	src_len: i32,
+	out: *mut u16,
+) -> i32 {
+	if src.is_null() || out.is_null() {
+		return 0;
+	}
+	let len = if src_len < 0 {
+		unsafe { CStr::from_ptr(src.cast()) }.to_bytes().len() as i32
+	} else {
+		src_len
+	};
+	let wide: Vec<u16> = unsafe { slice::from_raw_parts(src, len as usize) }
+		.iter()
+		.map(|&b| b as u16)
+		.collect();
+	GetStringTypeW(info_type, wide.as_ptr(), len, out)
+}
+
+#[winfn(alias(GetStringTypeExW))]
 fn GetStringTypeW(_info_type: u32, src: *const u16, src_len: i32, out: *mut u16) -> i32 {
 	if src.is_null() || out.is_null() {
 		SetLastError(ERROR_INVALID_PARAMETER);
@@ -246,9 +275,7 @@ fn CompareStringW(
 	}
 }
 
-const LCID_EN_US: u32 = 0x0409;
-const LOCALE_USER_DEFAULT: u32 = 0x0400;
-#[winfn]
+#[winfn(alias(GetSystemDefaultLCID))]
 fn GetUserDefaultLCID() -> u32 {
 	LCID_EN_US
 }
@@ -256,4 +283,130 @@ fn GetUserDefaultLCID() -> u32 {
 #[winfn]
 fn IsValidLocale(locale: u32, _flags: u32) -> i32 {
 	i32::from(locale == LCID_EN_US || locale == LOCALE_USER_DEFAULT)
+}
+
+#[winfn(alias(LCMapStringEx))]
+fn LCMapStringA(
+	_locale: u32,
+	flags: u32,
+	src: *const u8,
+	src_len: i32,
+	dst: *mut u8,
+	dst_len: i32,
+) -> i32 {
+	if src.is_null() {
+		return 0;
+	}
+	let len = if src_len < 0 {
+		unsafe { CStr::from_ptr(src.cast()) }.to_bytes().len()
+	} else {
+		src_len as usize
+	};
+	let s = unsafe { slice::from_raw_parts(src, len) };
+	let mapped: Vec<u8> = if flags & LCMAP_UPPERCASE != 0 {
+		s.iter().map(|c| c.to_ascii_uppercase()).collect()
+	} else if flags & LCMAP_LOWERCASE != 0 {
+		s.iter().map(|c| c.to_ascii_lowercase()).collect()
+	} else {
+		s.to_vec()
+	};
+	if dst_len == 0 {
+		return mapped.len() as i32;
+	}
+	if dst.is_null() || (mapped.len() as i32) > dst_len {
+		return 0;
+	}
+	unsafe { dst.copy_from_nonoverlapping(mapped.as_ptr(), mapped.len()) };
+	mapped.len() as i32
+}
+
+#[winfn]
+fn lstrlenW(s: *const u16) -> i32 {
+	if s.is_null() || (s as usize) & 1 != 0 {
+		return 0;
+	}
+	let mut len = 0i32;
+	unsafe {
+		while *s.offset(len as isize) != 0 {
+			len += 1;
+		}
+	}
+	len
+}
+
+#[winfn]
+fn CompareStringOrdinal(
+	s1: *const u16,
+	len1: i32,
+	s2: *const u16,
+	len2: i32,
+	ignore_case: i32,
+) -> i32 {
+	if s1.is_null() || s2.is_null() {
+		return 0;
+	}
+	let a = String::from_utf16_lossy(trim_nul(wc_input(s1, len1)));
+	let b = String::from_utf16_lossy(trim_nul(wc_input(s2, len2)));
+	let ord = if ignore_case != 0 {
+		a.to_lowercase().cmp(&b.to_lowercase())
+	} else {
+		a.cmp(&b)
+	};
+	match ord {
+		Ordering::Less => CSTR_LESS_THAN,
+		Ordering::Equal => CSTR_EQUAL,
+		Ordering::Greater => CSTR_GREATER_THAN,
+	}
+}
+
+#[winfn]
+fn NormalizeString(_form: u32, src: *const u16, src_len: i32, dst: *mut u16, dst_len: i32) -> i32 {
+	if src.is_null() {
+		return 0;
+	}
+	let input = wc_input(src, src_len);
+	if dst_len == 0 || dst.is_null() {
+		return input.len() as i32;
+	}
+	let copy = input.len().min(dst_len as usize);
+	unsafe { dst.copy_from_nonoverlapping(input.as_ptr(), copy) };
+	copy as i32
+}
+
+#[winfn]
+fn IsNormalizedString(_form: u32, _src: *const u16, _len: i32) -> i32 {
+	1
+}
+
+#[winfn]
+fn DosDateTimeToFileTime(date: u16, time: u16, filetime: *mut u64) -> i32 {
+	if filetime.is_null() {
+		return 0;
+	}
+	let _ = (date, time);
+	unsafe { filetime.write(0) };
+	1
+}
+
+#[winfn]
+fn CompareFileTime(ft1: *const u64, ft2: *const u64) -> i32 {
+	if ft1.is_null() || ft2.is_null() {
+		return 0;
+	}
+	let a = unsafe { *ft1 };
+	let b = unsafe { *ft2 };
+	match a.cmp(&b) {
+		Ordering::Less => -1,
+		Ordering::Equal => 0,
+		Ordering::Greater => 1,
+	}
+}
+
+#[winfn]
+fn FileTimeToLocalFileTime(utc: *const u64, local: *mut u64) -> i32 {
+	if utc.is_null() || local.is_null() {
+		return 0;
+	}
+	unsafe { local.write(*utc) };
+	1
 }

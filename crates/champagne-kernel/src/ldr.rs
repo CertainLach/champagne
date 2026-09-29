@@ -3,15 +3,10 @@ use moveit::{New, new};
 use nt_list::NtListElement;
 use nt_list::list::{NtList, NtListEntry, NtListHead};
 use nt_string::unicode_string::NtUnicodeString;
-use parking_lot::{Mutex, MutexGuard};
-use std::any::Any;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr::null;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 #[derive(NtList)]
 enum InLoad {}
@@ -226,66 +221,86 @@ pub struct TlsTemplate {
 	pub total_size: usize,
 }
 
-pub struct LoaderPrivate {
-	pub magic: u64,
-	pub tls_templates: Mutex<Vec<TlsTemplate>>,
-	objects: Mutex<HashMap<usize, Arc<dyn Any + Send + Sync>>>,
-	next_handle: AtomicUsize,
-	next_thread_id: AtomicU32,
-	tls_callbacks: Mutex<HashMap<usize, Vec<usize>>>,
-	wait_all_lock: Mutex<()>,
-	slist_lock: Mutex<()>,
-}
+pub mod unix {
+	use parking_lot::{Mutex, MutexGuard};
+	use std::any::Any;
+	use std::collections::HashMap;
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-pub const LOADER_PRIVATE_MAGIC: u64 = 0x444C4C4C_4F414452;
+	use crate::object::unix::VirtualObject;
 
-impl LoaderPrivate {
-	pub fn new() -> Self {
-		Self {
-			magic: LOADER_PRIVATE_MAGIC,
-			tls_templates: Mutex::new(Vec::new()),
-			objects: Mutex::new(HashMap::new()),
-			next_handle: AtomicUsize::new(0x1000),
-			next_thread_id: AtomicU32::new(0x100),
-			tls_callbacks: Mutex::new(HashMap::new()),
-			wait_all_lock: Mutex::new(()),
-			slist_lock: Mutex::new(()),
+	use super::TlsTemplate;
+
+	pub struct LoaderPrivate {
+		pub magic: u64,
+		pub tls_templates: Mutex<Vec<TlsTemplate>>,
+		objects: Mutex<HashMap<usize, Arc<dyn Any + Send + Sync>>>,
+		next_handle: AtomicUsize,
+		next_thread_id: AtomicU32,
+		tls_callbacks: Mutex<HashMap<usize, Vec<usize>>>,
+		wait_all_lock: Mutex<()>,
+		slist_lock: Mutex<()>,
+	}
+
+	pub const LOADER_PRIVATE_MAGIC: u64 = 0x444C4C4C_4F414452;
+
+	impl LoaderPrivate {
+		pub fn new() -> Self {
+			Self {
+				magic: LOADER_PRIVATE_MAGIC,
+				tls_templates: Mutex::new(Vec::new()),
+				objects: Mutex::new(HashMap::new()),
+				next_handle: AtomicUsize::new(0x1000),
+				next_thread_id: AtomicU32::new(0x100),
+				tls_callbacks: Mutex::new(HashMap::new()),
+				wait_all_lock: Mutex::new(()),
+				slist_lock: Mutex::new(()),
+			}
+		}
+		pub fn slist_lock(&self) -> MutexGuard<'_, ()> {
+			self.slist_lock.lock()
+		}
+		pub fn alloc_thread_id(&self) -> u32 {
+			// Windows thread ids are multiples of four
+			self.next_thread_id.fetch_add(4, Ordering::Relaxed)
+		}
+		pub fn wait_all_lock(&self) -> MutexGuard<'_, ()> {
+			self.wait_all_lock.lock()
+		}
+		pub fn register_tls_callbacks(&self, base: usize, callbacks: Vec<usize>) {
+			self.tls_callbacks.lock().insert(base, callbacks);
+		}
+		pub fn tls_callbacks_for(&self, base: usize) -> Vec<usize> {
+			self.tls_callbacks
+				.lock()
+				.get(&base)
+				.cloned()
+				.unwrap_or_default()
+		}
+		pub fn insert_object_raw(&self, object: Arc<dyn Any + Send + Sync>) -> usize {
+			// Windows handles are multiples of four
+			let handle = self.next_handle.fetch_add(4, Ordering::Relaxed);
+			self.objects.lock().insert(handle, object);
+			handle
+		}
+		pub fn insert_object<T: VirtualObject>(&self, object: Arc<T>) -> usize {
+			self.insert_object_raw(object)
+		}
+		pub fn duplicate_object(&self, handle: usize) -> Option<usize> {
+			let object = self.objects.lock().get(&handle).cloned()?;
+			Some(self.insert_object_raw(object))
+		}
+		pub fn get_object<T: VirtualObject>(&self, handle: usize) -> Option<Arc<T>> {
+			self.objects.lock().get(&handle).cloned()?.downcast().ok()
+		}
+		pub fn remove_object(&self, handle: usize) -> bool {
+			self.objects.lock().remove(&handle).is_some()
 		}
 	}
-	pub fn slist_lock(&self) -> MutexGuard<'_, ()> {
-		self.slist_lock.lock()
-	}
-	pub fn alloc_thread_id(&self) -> u32 {
-		// Windows thread ids are multiples of four
-		self.next_thread_id.fetch_add(4, Ordering::Relaxed)
-	}
-	pub fn wait_all_lock(&self) -> MutexGuard<'_, ()> {
-		self.wait_all_lock.lock()
-	}
-	pub fn register_tls_callbacks(&self, base: usize, callbacks: Vec<usize>) {
-		self.tls_callbacks.lock().insert(base, callbacks);
-	}
-	pub fn tls_callbacks_for(&self, base: usize) -> Vec<usize> {
-		self.tls_callbacks
-			.lock()
-			.get(&base)
-			.cloned()
-			.unwrap_or_default()
-	}
-	pub fn insert_object(&self, object: Arc<dyn Any + Send + Sync>) -> usize {
-		// Windows handles are multiples of four
-		let handle = self.next_handle.fetch_add(4, Ordering::Relaxed);
-		self.objects.lock().insert(handle, object);
-		handle
-	}
-	pub fn duplicate_object(&self, handle: usize) -> Option<usize> {
-		let object = self.objects.lock().get(&handle).cloned()?;
-		Some(self.insert_object(object))
-	}
-	pub fn get_object(&self, handle: usize) -> Option<Arc<dyn Any + Send + Sync>> {
-		self.objects.lock().get(&handle).cloned()
-	}
-	pub fn remove_object(&self, handle: usize) -> bool {
-		self.objects.lock().remove(&handle).is_some()
+	impl Default for LoaderPrivate {
+		fn default() -> Self {
+			Self::new()
+		}
 	}
 }

@@ -1,10 +1,6 @@
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
-use champagne_macros::winfn;
-
-use crate::peb::{ERROR_NO_MORE_ITEMS, SetLastError};
-
 const HEAP_HEADER: usize = 16;
 
 static PROCESS_HEAP: u8 = 0;

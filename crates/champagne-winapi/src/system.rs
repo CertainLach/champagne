@@ -3,6 +3,8 @@ use std::ffi::c_void;
 use champagne_macros::winfn;
 use tracing::debug;
 
+use crate::assert_size;
+
 #[repr(C)]
 struct SystemInfo {
 	processor_architecture: u16,
@@ -17,7 +19,7 @@ struct SystemInfo {
 	processor_level: u16,
 	processor_revision: u16,
 }
-const _: () = assert!(size_of::<SystemInfo>() == 48);
+assert_size!(SystemInfo, 48);
 
 const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 

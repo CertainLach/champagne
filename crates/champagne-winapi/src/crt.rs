@@ -24,8 +24,7 @@ fn realloc(mem: *mut c_void, size: usize) -> *mut c_void {
 	unsafe { heap_realloc(mem, size, false) }
 }
 
-#[winfn]
-#[alias(_msize)]
+#[winfn(alias(_msize))]
 fn msize(mem: *const c_void) -> usize {
 	unsafe { heap_requested(mem) }
 }

@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::process::exit;
 
 use champagne_kernel::tib::get_tib;
 use champagne_macros::winfn;
@@ -15,7 +16,7 @@ fn GetCurrentProcessId() -> u32 {
 #[winfn]
 fn ExitProcess(code: u32) {
 	info!("image requested exit: {code}");
-	std::process::exit(code as i32)
+	exit(code as i32)
 }
 
 #[winfn]
@@ -26,7 +27,7 @@ fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
 		return 0;
 	}
 	info!("image requested termination: {code}");
-	std::process::exit(code as i32)
+	exit(code as i32)
 }
 
 #[winfn]

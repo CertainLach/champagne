@@ -13,12 +13,12 @@ pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 pub const ERROR_PROC_NOT_FOUND: u32 = 127;
 pub const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 
-#[winfn]
+#[winfn(no_reset_last_error)]
 pub fn SetLastError(e: u32) {
 	get_tib().set_last_error(e);
 }
 
-#[winfn]
+#[winfn(no_reset_last_error)]
 pub fn GetLastError() -> u32 {
 	get_tib().last_error()
 }
