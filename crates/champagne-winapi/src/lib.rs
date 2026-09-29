@@ -35,6 +35,7 @@ pub mod slist;
 pub mod string;
 pub mod system;
 pub mod thread;
+pub mod threadpool;
 pub mod time;
 pub mod tls;
 pub mod version;
