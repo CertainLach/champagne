@@ -30,6 +30,7 @@ pub mod ldr;
 pub mod misc;
 pub mod net;
 pub mod object;
+pub mod path;
 pub mod peb;
 pub mod perf;
 pub mod process;
