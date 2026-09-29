@@ -32,6 +32,7 @@ pub mod perf;
 pub mod process;
 pub mod seh;
 pub mod slist;
+pub mod srw;
 pub mod string;
 pub mod system;
 pub mod thread;
