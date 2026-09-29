@@ -32,6 +32,7 @@ pub mod object;
 pub mod peb;
 pub mod perf;
 pub mod process;
+pub mod registry;
 pub mod seh;
 pub mod slist;
 pub mod srw;
