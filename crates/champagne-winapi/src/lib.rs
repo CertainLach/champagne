@@ -26,6 +26,7 @@ pub mod crt;
 pub mod crypto;
 pub mod event;
 pub mod heap;
+pub mod interlocked;
 pub mod ldr;
 pub mod memory;
 pub mod misc;
