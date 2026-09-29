@@ -25,6 +25,7 @@ pub mod critical_section;
 pub mod crt;
 pub mod crypto;
 pub mod event;
+pub mod file;
 pub mod heap;
 pub mod interlocked;
 pub mod ldr;
