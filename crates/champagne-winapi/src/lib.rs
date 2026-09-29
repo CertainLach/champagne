@@ -37,6 +37,7 @@ pub mod system;
 pub mod thread;
 pub mod time;
 pub mod tls;
+pub mod version;
 
 pub(crate) mod heap_raw;
 
