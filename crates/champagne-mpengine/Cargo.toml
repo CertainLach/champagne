@@ -1,0 +1,20 @@
+[package]
+name = "champagne-mpengine"
+version.workspace = true
+edition.workspace = true
+description = "Windows Defender mpengine.dll scanner using champagne"
+license.workspace = true
+
+[dependencies]
+champagne = { path = "../champagne" }
+champagne-winapi = { path = "../champagne-winapi" }
+champagne-kernel = { path = "../champagne-kernel" }
+tracing.workspace = true
+widestring.workspace = true
+nix.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "mpclient"

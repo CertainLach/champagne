@@ -83,3 +83,18 @@ fn LocalFree(mem: *mut c_void) -> *mut c_void {
 fn GetProcessHeap() -> *mut c_void {
 	process_heap()
 }
+
+#[winfn]
+fn HeapCreate(_options: u32, _initial_size: usize, _max_size: usize) -> *mut c_void {
+	process_heap()
+}
+
+#[winfn]
+fn HeapDestroy(_heap: *mut c_void) -> i32 {
+	1
+}
+
+#[winfn]
+fn HeapSetInformation(_heap: *mut c_void, _class: i32, _info: *const c_void, _len: usize) -> i32 {
+	1
+}
