@@ -41,7 +41,29 @@ fn module_handle(name: &str) -> Option<*mut c_void> {
 	if let Some(entry) = peb.find_entry(&format!("{stem}.dll")) {
 		return Some(entry.base().cast_mut().cast());
 	}
-	if matches!(stem, "kernel32" | "kernelbase" | "ntdll") {
+	if matches!(
+		stem,
+		"kernel32"
+			| "kernelbase"
+			| "ntdll" | "advapi32"
+			| "ws2_32"
+			| "crypt32"
+			| "bcrypt"
+			| "wintrust"
+			| "ole32" | "rpcrt4"
+			| "secur32"
+			| "user32"
+			| "userenv"
+			| "version"
+			| "shell32"
+			| "shlwapi"
+			| "iphlpapi"
+			| "setupapi"
+			| "wtsapi32"
+			| "wofutil"
+			| "wldp"
+	) || stem.starts_with("api-ms-win-")
+	{
 		return Some(kernel32_handle());
 	}
 	None
@@ -78,6 +100,11 @@ fn LoadLibraryExW(name: *const u16, _file: *const (), _flags: u32) -> *const () 
 			kernel32_handle().cast_const().cast()
 		}
 	}
+}
+
+#[winfn]
+fn FreeLibrary(_module: *const ()) -> i32 {
+	1
 }
 
 #[winfn]
