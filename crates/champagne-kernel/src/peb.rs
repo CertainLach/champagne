@@ -221,6 +221,7 @@ pub mod unix {
 
 	/// PEB emulation, only used on non-windows, in windows real PEB should be used.
 	pub struct VirtualPeb(Box<UnsafeCell<Peb>>);
+	unsafe impl Sync for VirtualPeb {}
 	impl VirtualPeb {
 		pub fn new() -> Self {
 			let mut peb: Peb = unsafe { mem::zeroed() };

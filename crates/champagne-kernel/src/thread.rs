@@ -19,9 +19,9 @@ pub mod unix {
 	use crate::object::unix::Object;
 	use crate::object::{INFINITE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 	use crate::peb::PebLike as _;
-	use crate::peb::unix::PebLikeUnixExt as _;
+	use crate::peb::unix::{PebLikeUnixExt as _, VirtualPeb};
 	use crate::tib::get_tib;
-	use crate::tib::unix::VirtualTib;
+	use crate::tib::unix::{EnteredVirtualTib, VirtualTib};
 
 	use super::CREATE_SUSPENDED;
 
@@ -137,6 +137,30 @@ pub mod unix {
 
 	pub const DLL_THREAD_ATTACH: u32 = 2;
 	pub const DLL_THREAD_DETACH: u32 = 3;
+
+	pub struct HostThread<'peb> {
+		tib: VirtualTib<'peb>,
+	}
+	impl<'peb> HostThread<'peb> {
+		pub fn attach(peb: &'peb VirtualPeb) -> Self {
+			let tib = VirtualTib::new(peb);
+			{
+				let _entered = tib.enter();
+				get_tib().get_peb().materialize_current_tls();
+				notify_modules(DLL_THREAD_ATTACH);
+			}
+			Self { tib }
+		}
+		pub fn enter(&self) -> EnteredVirtualTib {
+			self.tib.enter()
+		}
+	}
+	impl Drop for HostThread<'_> {
+		fn drop(&mut self) {
+			let _entered = self.tib.enter();
+			notify_modules(DLL_THREAD_DETACH);
+		}
+	}
 
 	pub struct SpawnedThread {
 		pub handle: *mut c_void,
