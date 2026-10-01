@@ -463,7 +463,10 @@ fn mut_mirror_raw<'o, T>(
 		offset > 0 && (offset as usize) < dll_file.len(),
 		"can't mirror value not from source dll file"
 	);
-	let rva = pe.file_offset_to_rva(offset as usize).expect("in image");
+	let rva = pe
+		.headers()
+		.file_offset_to_rva(offset as usize)
+		.expect("in image");
 	assert!((rva as usize) < mapped_image.len(), "rva is out of mapping");
 	unsafe { &mut *mapped_image.as_mut_ptr().byte_offset(rva as isize).cast() }
 }
@@ -474,7 +477,10 @@ fn mirror_raw<'o, T>(mapped_image: &'o [u8], dll_file: &[u8], pe: &PeFile, v: &T
 		offset > 0 && (offset as usize) < dll_file.len(),
 		"can't mirror value not from source dll file"
 	);
-	let rva = pe.file_offset_to_rva(offset as usize).expect("in image");
+	let rva = pe
+		.headers()
+		.file_offset_to_rva(offset as usize)
+		.expect("in image");
 	assert!((rva as usize) < mapped_image.len(), "rva is out of mapping");
 	unsafe { &*mapped_image.as_ptr().byte_offset(rva as isize).cast() }
 }
