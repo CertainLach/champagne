@@ -1,6 +1,7 @@
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::ptr::write_volatile;
+use std::slice;
 
 use crate::ldr::TlsTemplate;
 use crate::peb::{Peb, PebHandle, PebRef};
@@ -54,15 +55,18 @@ impl TibRef {
 	}
 	pub(crate) fn materialize_tls(&self, templates: &[TlsTemplate]) {
 		let existing = unsafe { (*self.0.get()).tls }.cast::<usize>();
-		let mut array = Vec::with_capacity(templates.len());
+		let existing: &[usize] = if existing.is_null() {
+			&[]
+		} else {
+			unsafe { slice::from_raw_parts(existing, existing.sub(1).read()) }
+		};
+		let mut array = Vec::with_capacity(templates.len() + 1);
+		array.push(templates.len());
 		for (index, template) in templates.iter().enumerate() {
-			let existing = if existing.is_null() {
-				0
-			} else {
-				unsafe { existing.add(index).read() }
-			};
-			if existing != 0 {
-				array.push(existing);
+			if let Some(&block) = existing.get(index)
+				&& block != 0
+			{
+				array.push(block);
 				continue;
 			}
 			let mut block = vec![0u8; template.total_size].into_boxed_slice();
@@ -70,7 +74,7 @@ impl TibRef {
 			array.push(Box::leak(block).as_mut_ptr() as usize);
 		}
 		let array = Box::leak(array.into_boxed_slice());
-		unsafe { (*self.0.get()).tls = array.as_mut_ptr().cast() };
+		unsafe { (*self.0.get()).tls = array[1..].as_mut_ptr().cast() };
 	}
 	pub fn tls_get(&self, index: u32) -> Option<*mut c_void> {
 		unsafe { (*self.0.get()).tls_slots.get(index as usize).copied() }
